@@ -1,23 +1,33 @@
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import sys
+sys.path.append("/home/tongjiayi/Jet-Nemotron/jetai/modeling")
 
-# model_name_or_path = "jet-ai/Jet-Nemotron-2B"
+from hf.modeling_jet_nemotron import JetNemotronForCausalLM
+from hf.configuration_jet_nemotron import JetNemotronConfig
+from vllm import LLM, SamplingParams
 
-# For local testing, you can use the following path.
-# NOTE: Be sure to download or soft-link the model weights to `jetai/modeling/hf`
-model_name_or_path = "jetai/modeling/hf/"
+def main():
+    model_name_or_path = "/home/tongjiayi/Jet-Nemotron/jetai/modeling/hf/"
 
-model = AutoModelForCausalLM.from_pretrained(model_name_or_path, 
-                                             trust_remote_code=True, 
-                                             attn_implementation="flash_attention_2",
-                                             torch_dtype=torch.bfloat16,
-                                             device_map="cuda")
-tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
-model = model.eval().cuda()
+    sampling_params = SamplingParams(
+        max_tokens=50,
+        temperature=0.0,
+        top_p=1.0
+    )
 
-input_str = "Hello, please introduce yourself."
+    llm = LLM(
+        model=model_name_or_path,
+        trust_remote_code=True,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.9,
+        dtype="bfloat16"
+    )
 
-input_ids = tokenizer(input_str, return_tensors="pt").input_ids.cuda()
-output = model.generate(input_ids, max_new_tokens=50, do_sample=False)
-output_str = tokenizer.decode(output[0], skip_special_tokens=True)
-print(output_str)
+    input_str = "Hello, which high school did you go to?"
+    outputs = llm.generate([input_str], sampling_params)
+
+    for output in outputs:
+        print(f"Prompt: {output.prompt}")
+        print(f"Generated text: {output.outputs[0].text}")
+
+if __name__ == "__main__":
+    main()
