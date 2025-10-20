@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,12 @@ from fla.ops.gated_delta_rule import (chunk_gated_delta_rule,
 from .dynamic_conv import DynamicShortConvolution
 from .configuration_jet_nemotron import JetNemotronConfig
 from .kv_cache import JetNemotronCache
+
+# @dataclass
+# class IntermediateTensors:
+#     hidden_states_per_layer: Optional[List[torch.Tensor]] = None
+#     attention_key_values: Optional[List[torch.Tensor]] = None
+#     mlp_outputs: Optional[List[torch.Tensor]] = None
 
 
 @dataclass
