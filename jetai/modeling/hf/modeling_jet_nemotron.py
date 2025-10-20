@@ -42,6 +42,8 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.deprecation import deprecate_kwarg
+from vllm.config import VllmConfig
+from vllm.attention import Attention
 
 
 from .configuration_jet_nemotron import JetNemotronConfig
@@ -153,16 +155,23 @@ def eager_attention_forward(
 class JetNemotronAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: JetNemotronConfig, layer_idx: Optional[int] = None, sliding_window: Optional[int] = None):
+    def __init__(self,
+                 vllm_config: VllmConfig,
+                 prefix: str,
+                 config: JetNemotronConfig, 
+                 layer_idx: Optional[int] = None, 
+                 sliding_window: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.prefix = prefix
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.sliding_window = sliding_window
+        self.attn = Attention(prefix=f"{prefix}.attn")
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
@@ -339,25 +348,29 @@ EFFICIENT_ATTENTION_CLASSES = {
 
 
 class JetNemotronDecoderLayer(nn.Module):
-    def __init__(self, config: JetNemotronConfig, layer_idx: int):
+    def __init__(self, 
+                 vllm_config: VllmConfig, 
+                 prefix: str,
+                 config: JetNemotronConfig, 
+                 layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         
         if config.layer_types[layer_idx] == "attn":
-            self.self_attn = JetNemotronAttention(config, layer_idx)
+            self.self_attn = JetNemotronAttention(vllm_config, f"{prefix}.self_attn", config, layer_idx)
         elif config.layer_types[layer_idx] == "swa":
             assert config.efficient_attention_config is not None, "Efficient attention config must be provided in JetNemotronConfig."
             assert "swa" in config.efficient_attention_config, (
                 "Sliding Window Attention is enabled but no `swa` configuration found in `efficient_attention_config`."
             )
-            self.self_attn = JetNemotronAttention(config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"])
+            self.self_attn = JetNemotronAttention(vllm_config, f"{prefix}.self_attn", config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"])
         else:
             assert config.layer_types[layer_idx] in EFFICIENT_ATTENTION_CLASSES, (
                 f"Layer type {config.layer_types[layer_idx]} not supported. Supported types are: "
                 f"{['attn', 'swa'] + list(EFFICIENT_ATTENTION_CLASSES.keys())}"
             )
             self.self_attn = EFFICIENT_ATTENTION_CLASSES[config.layer_types[layer_idx]](config, config.layer_types[layer_idx], layer_idx)
-
+        # 这里需要改吗？存疑
         self.mlp = JetNemotronMLP(config)
         self.input_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -566,16 +579,26 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
         config: JetNemotronConfig
     """
 
-    def __init__(self, config: JetNemotronConfig):
+    def __init__(self, 
+                 vllm_config: VllmConfig,
+                 prefix: str,
+                 config: JetNemotronConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [JetNemotronDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [JetNemotronDecoderLayer(vllm_config,
+                                     prefix=f"{prefix}.layers.{i}",
+                                     config=config, 
+                                     layer_idx=i) for i in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
+        self._attn_implementation = "flash_attention_2"
+        cfg = JetNemotronConfig()
+        print(f"---------------------CONFIG Using attention implementation: {cfg._attn_implementation}------------------------------")
+        print(f"---------------------MODEL Using attention implementation: {self._attn_implementation}------------------------------")
         assert self._attn_implementation in ["sdpa", "flash_attention_2"]
         self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = JetNemotronRotaryEmbedding(config=config)
@@ -827,9 +850,13 @@ class JetNemotronForCausalLM(JetNemotronPreTrainedModel, GenerationMixin):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
-    def __init__(self, config: JetNemotronConfig):
+    def __init__(self, 
+                 vllm_config: VllmConfig,
+                 prefix: str=""):
+                #  config: JetNemotronConfig):
+        config = vllm_config.model_config
         super().__init__(config)
-        self.model = JetNemotronModel(config)
+        self.model = JetNemotronModel(vllm_config, prefix=f"{prefix}.model", config=config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

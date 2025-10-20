@@ -1,33 +1,33 @@
-import sys
-sys.path.append("/home/tongjiayi/Jet-Nemotron/jetai/modeling")
+from vllm import LLM
 
-from hf.modeling_jet_nemotron import JetNemotronForCausalLM
-from hf.configuration_jet_nemotron import JetNemotronConfig
-from vllm import LLM, SamplingParams
+llm = LLM(
+    model="/home/tongjiayi/Jet-Nemotron/jetai/modeling/hf/",
+    trust_remote_code=True,
+    task="generate"
+)
 
-def main():
-    model_name_or_path = "/home/tongjiayi/Jet-Nemotron/jetai/modeling/hf/"
 
-    sampling_params = SamplingParams(
-        max_tokens=50,
-        temperature=0.0,
-        top_p=1.0
-    )
 
-    llm = LLM(
-        model=model_name_or_path,
-        trust_remote_code=True,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.9,
-        dtype="bfloat16"
-    )
+# import torch
+# from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    input_str = "Hello, which high school did you go to?"
-    outputs = llm.generate([input_str], sampling_params)
+# # model_name_or_path = "jet-ai/Jet-Nemotron-2B"
 
-    for output in outputs:
-        print(f"Prompt: {output.prompt}")
-        print(f"Generated text: {output.outputs[0].text}")
+# # For local testing, you can use the following path.
+# # NOTE: Be sure to download or soft-link the model weights to `jetai/modeling/hf`
+# model_name_or_path = "jetai/modeling/hf/"
 
-if __name__ == "__main__":
-    main()
+# model = AutoModelForCausalLM.from_pretrained(model_name_or_path, 
+#                                              trust_remote_code=True, 
+#                                              attn_implementation="flash_attention_2",
+#                                              torch_dtype=torch.bfloat16,
+#                                              device_map="cuda")
+# tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+# model = model.eval().cuda()
+
+# input_str = "Hello, please introduce yourself."
+
+# input_ids = tokenizer(input_str, return_tensors="pt").input_ids.cuda()
+# output = model.generate(input_ids, max_new_tokens=500, do_sample=False)
+# output_str = tokenizer.decode(output[0], skip_special_tokens=True)
+# print(output_str)
