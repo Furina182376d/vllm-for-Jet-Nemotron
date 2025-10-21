@@ -1,10 +1,28 @@
+from jetai.vllm_plugin import register
 from vllm import LLM
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,5,6"
 
-llm = LLM(
-    model="/home/tongjiayi/Jet-Nemotron/jetai/modeling/hf/",
-    trust_remote_code=True,
-    task="generate"
-)
+def main():
+    register()  # 🔥 关键一步：注册模型类型
+    
+    llm = LLM(
+        model="/home/tongjiayi/Jet-Nemotron/jetai/modeling/hf/",
+        trust_remote_code=True,
+        dtype="bfloat16",
+        task="generate",
+        enforce_eager=True,  # 禁用图编译，减少兼容性问题
+        load_format="dummy",  # 使用虚拟权重进行测试
+        gpu_memory_utilization=0.5,
+    )
+
+    prompt = "Hello! Please introduce yourself."
+    output = llm.generate([prompt])
+    print(output[0].outputs[0].text)
+
+if __name__ == '__main__':
+    main()
+
 
 
 

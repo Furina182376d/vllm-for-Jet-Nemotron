@@ -42,7 +42,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.deprecation import deprecate_kwarg
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, CacheConfig
 from vllm.attention import Attention
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.linear import (
@@ -93,7 +93,7 @@ class JetNemotronMLP(nn.Module):
 
         self.down_proj = RowParallelLinear(
             input_size=self.intermediate_size,
-            output_sizes=self.hidden_size,
+            output_size=self.hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
@@ -207,7 +207,7 @@ class JetNemotronAttention(nn.Module):
         # self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False, prefix=f"{prefix}.o_proj",)
         self.qkv_proj = QKVParallelLinear(
             hidden_size=config.hidden_size,
-            head_dim=self.head_dim,
+            head_size=self.head_dim,
             total_num_heads=config.num_attention_heads,
             total_num_kv_heads=config.num_key_value_heads,
             bias=True,
@@ -279,26 +279,40 @@ class JetNemotronAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[JetNemotronCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
-        Simplified forward pass for vLLM inference.
+        vLLM-compatible forward: simplified for inference, maintains original interface.
+        Sliding window, past_key_value, and attention_mask are ignored because vLLM
+        backend (FlashAttention / SDPA) handles them automatically.
 
         Args:
-            hidden_states: [batch, seq_len, hidden_size]
-            cos, sin: rotary embedding tensors, shape [seq_len, head_dim] or [1, seq_len, head_dim]
+            hidden_states: [B, S, H]
+            position_embeddings: (cos, sin) RoPE embeddings, shapes [S, D] or [1, S, D]
+            attention_mask: ignored
+            past_key_value: ignored
+            cache_position: ignored
+        Returns:
+            Tuple of:
+                - attn_output: [B, S, H]
+                - None (placeholder for attn_weights)
+                - None (placeholder for past_key_value)
         """
+        cos, sin = position_embeddings
+        bsz, seq_len, _ = hidden_states.size()
+
         # === 1️⃣ QKV projection ===
         qkv, _ = self.qkv_proj(hidden_states)
         q_size = self.num_attention_heads * self.head_dim
         kv_size = self.num_key_value_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        bsz, seq_len, _ = hidden_states.size()
-
-        # === 2️⃣ Reshape ===
-        q = q.view(bsz, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)  # [B, H, S, D]
+        # === 2️⃣ Reshape Q/K/V ===
+        q = q.view(bsz, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
@@ -306,6 +320,7 @@ class JetNemotronAttention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # === 4️⃣ Scaled Dot-Product Attention ===
+        # vLLM backend will automatically handle causal mask and prefill cache
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, dropout_p=0.0, is_causal=True
         )
@@ -314,7 +329,7 @@ class JetNemotronAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         output, _ = self.o_proj(attn_output)
 
-        return output
+        return output, None
 
 
 class JetNemotronRMSNorm(nn.Module):
@@ -346,7 +361,9 @@ class JetNemotronDecoderLayer(nn.Module):
     def __init__(self,
                  config: JetNemotronConfig, 
                  layer_idx: int, 
-                 prefix: str = "",):
+                 prefix: str = "",
+                 cache_config: CacheConfig | None = None,
+                 quant_config: QuantizationConfig | None = None, ):
         super().__init__()
         self.hidden_size = config.hidden_size
         
@@ -385,19 +402,14 @@ class JetNemotronDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         
         # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
+        attn_output, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )
-                
-        hidden_states = residual + hidden_states
+            cos=position_embeddings[0] if position_embeddings is not None else None,
+            sin=position_embeddings[1] if position_embeddings is not None else None,
+        ), None
 
+        hidden_states = residual + attn_output
+        
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -582,9 +594,11 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [JetNemotronDecoderLayer(config=config, 
-                                     layer_idx=i,
-                                     prefix=f"{prefix}.layers.{i}") for i in range(config.num_hidden_layers)]
+            [JetNemotronDecoderLayer(
+                config=config, 
+                layer_idx=i,
+                prefix=f"{prefix}.layers.{i}",) 
+            for i in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
         self._attn_implementation = "flash_attention_2"
@@ -609,27 +623,106 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
     @add_start_docstrings_to_model_forward(JET_INPUTS_DOCSTRING)
     def forward(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # 如果给了inputs_embeds就用它，否则通过embedding层生成
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[JetNemotronCache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ) -> BaseModelOutputWithPast:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
+
+        if use_cache and past_key_values is None:
+            past_key_values = JetNemotronCache()
+
         if inputs_embeds is None:
-            hidden_states = self.get_input_embeddings(input_ids)
-        else:
-            hidden_states = inputs_embeds
+            inputs_embeds = self.embed_tokens(input_ids)
 
-        # rotary embedding（如果你的模型使用RoPE）
-        position_embeddings = self.rotary_emb(hidden_states, positions)
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
 
-        # 逐层decoder
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings, intermediate_tensors)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
 
-        # 最后一层norm
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        )
+
+        hidden_states = inputs_embeds
+
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    partial(decoder_layer.__call__, **flash_attn_kwargs),
+                    hidden_states,
+                    causal_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **flash_attn_kwargs,
+                )
+
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
 
 
     def _update_causal_mask(
@@ -758,7 +851,7 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
-
+# @register_model("jet_nemotron")
 class JetNemotronForCausalLM(JetNemotronPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -766,10 +859,10 @@ class JetNemotronForCausalLM(JetNemotronPreTrainedModel, GenerationMixin):
 
     def __init__(self, 
                  config: JetNemotronConfig,
-                 vllm_config: VllmConfig,
+                 vllm_config: Optional[VllmConfig] = None,
                  prefix: str=""):
-        # config = vllm_config.model_config
         super().__init__(config)
+        self.vllm_config = vllm_config
         self.model = JetNemotronModel(config=config, vllm_config=vllm_config, prefix=f"{prefix}.model")
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
