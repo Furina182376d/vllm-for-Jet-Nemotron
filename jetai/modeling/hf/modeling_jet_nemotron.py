@@ -182,12 +182,14 @@ def eager_attention_forward(
 class JetNemotronAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self,
-                 config: JetNemotronConfig, 
-                 layer_idx: Optional[int] = None, 
-                 sliding_window: Optional[int] = None, 
-                 prefix: str = "",
-                 quant_config: QuantizationConfig | None = None,):
+    def __init__(
+        self,
+        config: JetNemotronConfig, 
+        layer_idx: Optional[int] = None, 
+        sliding_window: Optional[int] = None, 
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -278,53 +280,98 @@ class JetNemotronAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[JetNemotronCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        """
-        vLLM-compatible forward: simplified for inference, maintains original interface.
-        Sliding window, past_key_value, and attention_mask are ignored because vLLM
-        backend (FlashAttention / SDPA) handles them automatically.
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        Args:
-            hidden_states: [B, S, H]
-            position_embeddings: (cos, sin) RoPE embeddings, shapes [S, D] or [1, S, D]
-            attention_mask: ignored
-            past_key_value: ignored
-            cache_position: ignored
-        Returns:
-            Tuple of:
-                - attn_output: [B, S, H]
-                - None (placeholder for attn_weights)
-                - None (placeholder for past_key_value)
-        """
-        cos, sin = position_embeddings
-        bsz, seq_len, _ = hidden_states.size()
+        # === 1️⃣ 滑动窗口掩码处理 ===
+        if self.sliding_window is not None and self.config._attn_implementation != "flash_attention_2":            
+            attention_mask = self._update_causal_mask_for_sliding_window(attention_mask, hidden_states, past_key_value)
 
-        # === 1️⃣ QKV projection ===
+        # === 2️⃣ 合并QKV投影 ===
         qkv, _ = self.qkv_proj(hidden_states)
         q_size = self.num_attention_heads * self.head_dim
         kv_size = self.num_key_value_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        # === 2️⃣ Reshape Q/K/V ===
-        q = q.view(bsz, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # === 3️⃣ 重塑Q/K/V ===
+        q = q.view(hidden_shape).transpose(1, 2)
+        k = k.view(hidden_shape).transpose(1, 2)
+        v = v.view(hidden_shape).transpose(1, 2)
 
-        # === 3️⃣ Apply Rotary Positional Embedding ===
+        # === 4️⃣ 应用旋转位置编码 ===
+        cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # === 4️⃣ Scaled Dot-Product Attention ===
-        # vLLM backend will automatically handle causal mask and prefill cache
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, dropout_p=0.0, is_causal=True
+        # === 5️⃣ 键值缓存更新 ===
+        if past_key_value is not None:
+            state = past_key_value.update(
+                attn_state=(k, v), layer_idx=self.layer_idx, 
+                offset=hidden_states.shape[1],
+                cache_kwargs={"window_size": self.sliding_window})
+            k, v = state["attn_state"]
+
+        # === 6️⃣ 滑动窗口设置 ===
+        fa2_sliding_window = None
+        if self.sliding_window is not None:
+            fa2_sliding_window = self.sliding_window - 1
+
+        # === 7️⃣ 选择注意力实现 ===
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            if self.config._attn_implementation == "sdpa":                
+                past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
+                if self.sliding_window is None:
+                    if AttentionMaskConverter._ignore_causal_mask_sdpa(
+                        attention_mask,
+                        inputs_embeds=hidden_states,
+                        past_key_values_length=past_seen_tokens,
+                        sliding_window=self.sliding_window,
+                        is_training=self.training,
+                    ):
+                        attention_mask = None
+
+            elif self.config._attn_implementation == "flash_attention_2":
+                if attention_mask is not None:
+                    assert len(attention_mask.shape) == 2, "Attention mask must be 2D"
+                    attention_mask = attention_mask[:, -k.shape[2]:]
+            else:
+                raise ValueError(
+                    f"Unsupported attention implementation: {self.config._attn_implementation}. "
+                    "Supported implementations are: eager, sdpa, flash_attention_2."
+                )
+                
+            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+                logger.warning_once(
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        # === 8️⃣ 注意力计算 ===
+        attn_output, attn_weights = attention_interface(
+            self,
+            q,
+            k,
+            v,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=fa2_sliding_window,
+            **kwargs,
         )
 
-        # === 5️⃣ Output projection ===
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        # === 9️⃣ 滑动窗口修剪 ===
+        if self.sliding_window is not None and past_key_value is not None:
+            past_key_value.trim_attn_state(self.layer_idx, self.sliding_window)
+
+        # === 🔟 输出投影 ===
+        attn_output = attn_output.transpose(1, 2).contiguous().view(*input_shape, -1)
         output, _ = self.o_proj(attn_output)
 
-        return output, None
+        return output, attn_weights
 
 
 class JetNemotronRMSNorm(nn.Module):
@@ -353,33 +400,26 @@ EFFICIENT_ATTENTION_CLASSES = {
 
 
 class JetNemotronDecoderLayer(nn.Module):
-    def __init__(self,
-                 config: JetNemotronConfig, 
-                 layer_idx: int, 
-                 prefix: str = "",
-                 cache_config: CacheConfig | None = None,
-                 quant_config: QuantizationConfig | None = None, ):
+    def __init__(self, config: JetNemotronConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         
         if config.layer_types[layer_idx] == "attn":
-            self.self_attn = JetNemotronAttention(
-                config, layer_idx, prefix=f"{prefix}.self_attn")
+            self.self_attn = JetNemotronAttention(config, layer_idx)
         elif config.layer_types[layer_idx] == "swa":
             assert config.efficient_attention_config is not None, "Efficient attention config must be provided in JetNemotronConfig."
             assert "swa" in config.efficient_attention_config, (
                 "Sliding Window Attention is enabled but no `swa` configuration found in `efficient_attention_config`."
             )
-            self.self_attn = JetNemotronAttention(
-                config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"],
-                prefix=f"{prefix}.self_attn")
+            self.self_attn = JetNemotronAttention(config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"])
         else:
             assert config.layer_types[layer_idx] in EFFICIENT_ATTENTION_CLASSES, (
                 f"Layer type {config.layer_types[layer_idx]} not supported. Supported types are: "
                 f"{['attn', 'swa'] + list(EFFICIENT_ATTENTION_CLASSES.keys())}"
             )
             self.self_attn = EFFICIENT_ATTENTION_CLASSES[config.layer_types[layer_idx]](config, config.layer_types[layer_idx], layer_idx)
-        self.mlp = JetNemotronMLP(config, prefix=f"{prefix}.mlp")
+
+        self.mlp = JetNemotronMLP(config)
         self.input_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -400,14 +440,19 @@ class JetNemotronDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         
         # Self Attention
-        attn_output, self_attn_weights = self.self_attn(
+        hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
-            cos=position_embeddings[0] if position_embeddings is not None else None,
-            sin=position_embeddings[1] if position_embeddings is not None else None,
-        ), None
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+                
+        hidden_states = residual + hidden_states
 
-        hidden_states = residual + attn_output
-        
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -582,30 +627,19 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
         config: JetNemotronConfig
     """
 
-    def __init__(self, 
-                 config: JetNemotronConfig,
-                 vllm_config: VllmConfig,
-                 prefix: str = "",):
+    def __init__(self, config: JetNemotronConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [JetNemotronDecoderLayer(
-                config=config, 
-                layer_idx=i,
-                prefix=f"{prefix}.layers.{i}",) 
-            for i in range(config.num_hidden_layers)]
+            [JetNemotronDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
-        self._attn_implementation = "flash_attention_2"
-        cfg = JetNemotronConfig()
-        print(f"---------------------CONFIG Using attention implementation: {cfg._attn_implementation}------------------------------")
-        print(f"---------------------MODEL Using attention implementation: {self._attn_implementation}------------------------------")
         assert self._attn_implementation in ["sdpa", "flash_attention_2"]
         self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = JetNemotronRotaryEmbedding(config=config) 
+        self.rotary_emb = JetNemotronRotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -721,7 +755,6 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-
 
     def _update_causal_mask(
         self,
@@ -849,19 +882,15 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
-# @register_model("jet_nemotron")
+
 class JetNemotronForCausalLM(JetNemotronPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
-    def __init__(self, 
-                 config: JetNemotronConfig,
-                 vllm_config: Optional[VllmConfig] = None,
-                 prefix: str=""):
+    def __init__(self, config: JetNemotronConfig):
         super().__init__(config)
-        self.vllm_config = vllm_config
-        self.model = JetNemotronModel(config=config, vllm_config=vllm_config, prefix=f"{prefix}.model")
+        self.model = JetNemotronModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
