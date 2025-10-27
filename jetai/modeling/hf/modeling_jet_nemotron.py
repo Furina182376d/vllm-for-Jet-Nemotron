@@ -200,11 +200,6 @@ class JetNemotronAttention(nn.Module):
         self.sliding_window = sliding_window
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        # self.attn = Attention(prefix=f"{prefix}.attn")
-        # self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True, prefix=f"{prefix}.q_proj",)
-        # self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True, prefix=f"{prefix}.k_proj",)
-        # self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True, prefix=f"{prefix}.v_proj",)
-        # self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False, prefix=f"{prefix}.o_proj",)
         self.qkv_proj = QKVParallelLinear(
             hidden_size=config.hidden_size,
             head_size=self.head_dim,
@@ -368,13 +363,16 @@ class JetNemotronDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         
         if config.layer_types[layer_idx] == "attn":
-            self.self_attn = JetNemotronAttention(config, layer_idx, prefix=f"{prefix}.self_attn")
+            self.self_attn = JetNemotronAttention(
+                config, layer_idx, prefix=f"{prefix}.self_attn")
         elif config.layer_types[layer_idx] == "swa":
             assert config.efficient_attention_config is not None, "Efficient attention config must be provided in JetNemotronConfig."
             assert "swa" in config.efficient_attention_config, (
                 "Sliding Window Attention is enabled but no `swa` configuration found in `efficient_attention_config`."
             )
-            self.self_attn = JetNemotronAttention(config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"], prefix=f"{prefix}.self_attn")
+            self.self_attn = JetNemotronAttention(
+                config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"],
+                prefix=f"{prefix}.self_attn")
         else:
             assert config.layer_types[layer_idx] in EFFICIENT_ATTENTION_CLASSES, (
                 f"Layer type {config.layer_types[layer_idx]} not supported. Supported types are: "
