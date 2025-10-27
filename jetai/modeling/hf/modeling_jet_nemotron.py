@@ -83,28 +83,13 @@ class JetNemotronMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.act_fn = ACT2FN[config.hidden_act]
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_sizes=[self.intermediate_size, self.intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-
-        self.down_proj = RowParallelLinear(
-            input_size=self.intermediate_size,
-            output_size=self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-        )
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         
 
     def forward(self, hidden_state):
-        gate, up = self.gate_up_proj(hidden_state)
-        x = self.act_fn(gate) * up
-        x, _ = self.down_proj(x)
-        return x
+        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
 def rotate_half(x):
@@ -319,6 +304,8 @@ class JetNemotronAttention(nn.Module):
 
         # === 7️⃣ 选择注意力实现 ===
         attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation == "vllm":
+            self.config._attn_implementation = "eager"
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa":                
                 past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
@@ -400,18 +387,25 @@ EFFICIENT_ATTENTION_CLASSES = {
 
 
 class JetNemotronDecoderLayer(nn.Module):
-    def __init__(self, config: JetNemotronConfig, layer_idx: int):
+    def __init__(
+            self,
+            config: JetNemotronConfig,
+            layer_idx: int,
+            prefix: str = "",
+            cache_config: CacheConfig | None = None,
+            quant_config: QuantizationConfig | None = None, ):
         super().__init__()
         self.hidden_size = config.hidden_size
         
         if config.layer_types[layer_idx] == "attn":
-            self.self_attn = JetNemotronAttention(config, layer_idx)
+            self.self_attn = JetNemotronAttention(config, layer_idx, prefix=f"{prefix}.self_attn", quant_config=quant_config)
         elif config.layer_types[layer_idx] == "swa":
             assert config.efficient_attention_config is not None, "Efficient attention config must be provided in JetNemotronConfig."
             assert "swa" in config.efficient_attention_config, (
                 "Sliding Window Attention is enabled but no `swa` configuration found in `efficient_attention_config`."
             )
-            self.self_attn = JetNemotronAttention(config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"])
+            self.self_attn = JetNemotronAttention(config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"],
+                                                  prefix=f"{prefix}.self_attn", quant_config=quant_config)
         else:
             assert config.layer_types[layer_idx] in EFFICIENT_ATTENTION_CLASSES, (
                 f"Layer type {config.layer_types[layer_idx]} not supported. Supported types are: "
@@ -419,7 +413,7 @@ class JetNemotronDecoderLayer(nn.Module):
             )
             self.self_attn = EFFICIENT_ATTENTION_CLASSES[config.layer_types[layer_idx]](config, config.layer_types[layer_idx], layer_idx)
 
-        self.mlp = JetNemotronMLP(config)
+        self.mlp = JetNemotronMLP(config, prefix=f"{prefix}.mlp", quant_config=quant_config)
         self.input_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -627,17 +621,25 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
         config: JetNemotronConfig
     """
 
-    def __init__(self, config: JetNemotronConfig):
+    def __init__(self,
+                 config: JetNemotronConfig,
+                 prefix: str = "",
+                 quant_config: QuantizationConfig | None = None, ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [JetNemotronDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [JetNemotronDecoderLayer(config, layer_idx=layer_idx, prefix=f"{prefix}.layers.{layer_idx}") for layer_idx in range(config.num_hidden_layers)]
         )
-        self._attn_implementation = config._attn_implementation
-        assert self._attn_implementation in ["sdpa", "flash_attention_2"]
+        # self._attn_implementation = config._attn_implementation
+        if config._attn_implementation == "vllm":
+            # 将 vllm 映射为支持的实现
+            self._attn_implementation = "eager"  # 或根据环境选择其他实现
+        else:
+            self._attn_implementation = config._attn_implementation
+        assert self._attn_implementation in ["sdpa", "flash_attention_2", "eager"]
         self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = JetNemotronRotaryEmbedding(config=config)
 
@@ -888,9 +890,12 @@ class JetNemotronForCausalLM(JetNemotronPreTrainedModel, GenerationMixin):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
-    def __init__(self, config: JetNemotronConfig):
+    def __init__(self,
+                 config: JetNemotronConfig,
+                 prefix: str = "",
+                 quant_config: QuantizationConfig | None = None, ):
         super().__init__(config)
-        self.model = JetNemotronModel(config)
+        self.model = JetNemotronModel(config, prefix=f"{prefix}.model", quant_config=quant_config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

@@ -143,7 +143,8 @@ class JetNemotronConfig(PretrainedConfig):
         rope_scaling=None,
         attention_dropout=0.0,
         layer_types=None,
-        efficient_attention_config=None,        
+        efficient_attention_config=None,
+        _attn_implementation="flash_attention_2",        
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -152,7 +153,7 @@ class JetNemotronConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-        self._attn_implementation = "flash_attention_2"
+        self._attn_implementation = _attn_implementation
 
         # for backward compatibility
         if num_key_value_heads is None:

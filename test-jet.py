@@ -1,7 +1,7 @@
 from jetai.vllm_plugin import register
 from vllm import LLM
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,5,6"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,7"
 
 def main():
     register()  # 🔥 关键一步：注册模型类型
@@ -13,7 +13,8 @@ def main():
         task="generate",
         enforce_eager=True,  # 禁用图编译，减少兼容性问题
         load_format="dummy",  # 使用虚拟权重进行测试
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=0.3,
+        max_num_batched_tokens=1024, 
     )
 
     prompt = "Hello! Please introduce yourself."
