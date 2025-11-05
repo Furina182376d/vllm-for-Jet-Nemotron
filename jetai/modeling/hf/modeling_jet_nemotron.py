@@ -85,10 +85,27 @@ class JetNemotronMLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        # self.gate_up_proj = MergedColumnParallelLinear(
+        #     self.hidden_size, 
+        #     [self.intermediate_size] * 2, 
+        #     bias=False, 
+        #     quant_config=quant_config
+        # )
+        # self.down_proj = RowParallelLinear(
+        #     self.intermediate_size, 
+        #     self.hidden_size, 
+        #     bias=False, 
+        #     quant_config=quant_config
+        # )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_state):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+    # def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    #     gate_up, _ = self.gate_up_proj(hidden_states)
+    #     activated = self.act_fn(gate_up)
+    #     output, _ = self.down_proj(activated)
+    #     return output
 
 
 def rotate_half(x):
@@ -176,6 +193,7 @@ class JetNemotronAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.config._attn_implementation = "eager"
         self.layer_idx = layer_idx
         self.prefix = prefix
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -188,6 +206,17 @@ class JetNemotronAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        # self.attn = attn_cls(
+        #     num_heads=config.num_attention_heads,
+        #     head_dim=self.head_dim,
+        #     scaling=self.scaling,
+        #     num_kv_heads=config.num_key_value_heads,
+        #     cache_config=getattr(config, "cache_config", None),
+        #     quant_config=quant_config,
+        #     logits_soft_cap=getattr(config, "attn_logits_soft_cap", None),
+        #     per_layer_sliding_window=sliding_window,
+        #     prefix=f"{prefix}.attn",
+        # )
 
     def _get_target_length(
         self,
@@ -278,8 +307,6 @@ class JetNemotronAttention(nn.Module):
             fa2_sliding_window = self.sliding_window - 1
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation == "vllm":
-            self.config._attn_implementation = "eager"  # map vllm to eager
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa":                
                 past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
@@ -873,8 +900,6 @@ class JetNemotronForCausalLM(JetNemotronPreTrainedModel, GenerationMixin):
         self.model = JetNemotronModel(config, prefix=f"{prefix}.model", quant_config=quant_config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        print("===================lm_head.weight.shape:", self.lm_head.weight.shape)
-
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -946,34 +971,50 @@ class JetNemotronForCausalLM(JetNemotronPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        try:
+            output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            )
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            cache_position=cache_position,
-            **kwargs,
-        )
+            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            outputs: BaseModelOutputWithPast = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
+            hidden_states = outputs.last_hidden_state
+        except Exception as e:
+            print("Error in calling JetNemotronModel forward:", e)
+            raise e
+        try:
+            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            hidden_slice = hidden_states[:, slice_indices, :]
+            logits = self.lm_head(hidden_slice)
+        except Exception as e:
+            print("Error in returning CausalLMOutputWithPast:", e)
+            raise e
+        print("==============hidden_states shape:", hidden_states.shape,"==================")
+        print("==============hidden_slice shape:", hidden_slice.shape,"==================")
+        print("==============lm_head weight shape:", self.lm_head.weight.shape,"==================")
+        print("==============logits shape:", logits.shape,"==================")
+        
+        try:
+            loss = None
+            if labels is not None:
+                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+        except Exception as e:
+            print("Error in computing loss:", e)
+            raise e
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
