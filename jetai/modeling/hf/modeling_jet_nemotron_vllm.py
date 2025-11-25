@@ -17,7 +17,7 @@
 # This file is modified from https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py
 
 from functools import partial
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, Iterable, Set
 
 import torch
 from torch import nn
@@ -42,6 +42,27 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.deprecation import deprecate_kwarg
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+                                               QKVParallelLinear,
+                                               RowParallelLinear)
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.attention import Attention, AttentionType
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.config import CacheConfig, VllmConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead, VocabParallelEmbedding)
+from vllm.sequence import IntermediateTensors, PoolerOutput
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader, maybe_remap_kv_scale_name)
+from .interfaces import SupportsLoRA, SupportsPP
+from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
+                    is_pp_missing_parameter,
+                    make_empty_intermediate_tensors_factory, make_layers,
+                    maybe_prefix)
+
+
+
 
 
 from .configuration_jet_nemotron import JetNemotronConfig
@@ -65,17 +86,32 @@ _CONFIG_FOR_DOC = "JetNemotronConfig"
 
 
 class JetNemotronMLP(nn.Module):
-    def __init__(self, config: JetNemotronConfig):
+    def __init__(self, config: JetNemotronConfig, quant_config: Optional[QuantizationConfig] = None,prefix: str = "",):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            self.hidden_size,
+            [self.intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, hidden_state):
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
 def rotate_half(x):
@@ -153,20 +189,105 @@ def eager_attention_forward(
 class JetNemotronAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: JetNemotronConfig, layer_idx: Optional[int] = None, sliding_window: Optional[int] = None):
+    def __init__(self, config: JetNemotronConfig, layer_idx: Optional[int] = None, sliding_window: Optional[int] = None,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 cache_config: Optional[CacheConfig] = None,
+                 prefix: str = "",):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+         # === 基础参数 ===
+        self.hidden_size = config.hidden_size
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
+        self.scaling = self.head_dim ** -0.5
+        self.rope_theta = getattr(config, "rope_theta", 10000)
         self.sliding_window = sliding_window
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.attn_type = getattr(config, "_attn_implementation", AttentionType.DECODER)
+        
+        tp_size = get_tensor_model_parallel_world_size()
+        assert self.total_num_heads % tp_size == 0, "num_heads must be divisible by TP size"
+        self.num_heads = self.total_num_heads // tp_size
+
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+        
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=config.max_position_embeddings,
+            base=self.rope_theta,
+            rope_scaling=self.rope_scaling,
+        )
+        
+        self.attn = Attention(self.num_heads,
+                              self.head_dim,
+                              self.scaling,
+                              num_kv_heads=self.num_kv_heads,
+                              cache_config=cache_config,
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn",
+                              attn_type=self.attn_type)
+
+        # # Decide backend based on sliding_window or layer type
+        # layer_type = None
+        # if layer_idx is not None and hasattr(config, "layer_types"):
+        #     layer_type = config.layer_types[layer_idx]
+
+        # if sliding_window is not None or layer_type == "swa":
+        #     # You may have a vLLM-compatible SlidingWindowAttention implementation.
+        #     # Replace SlidingWindowAttention below with your project's class if different.
+        #     self.attn = SlidingWindowAttention(
+        #         num_heads=self.num_heads,
+        #         head_dim=self.head_dim,
+        #         scaling=self.scaling,
+        #         num_kv_heads=self.num_kv_heads,
+        #         window_size=sliding_window or config.efficient_attention_config["swa"]["window_size"],
+        #         cache_config=cache_config,
+        #         quant_config=quant_config,
+        #         prefix=f"{prefix}.swa" if prefix else f"layers.{layer_idx}.swa",
+        #     )
+        # elif layer_type in getattr(config, "efficient_attention_config", {}) and layer_type in EFFICIENT_ATTENTION_CLASSES:
+        #     backend_cls = EFFICIENT_ATTENTION_CLASSES[layer_type]
+        #     self.attn = backend_cls(config, layer_type, layer_idx)
+        # else:
+        #     self.attn = Attention(
+        #         num_heads=self.num_heads,
+        #         head_dim=self.head_dim,
+        #         scaling=self.scaling,
+        #         num_kv_heads=self.num_kv_heads,
+        #         cache_config=cache_config,
+        #         quant_config=quant_config,
+        #         prefix=f"{prefix}.attn",
+        #         attn_type=self.attn_type,
+        #     )
+               
 
     def _get_target_length(
         self,
@@ -224,93 +345,15 @@ class JetNemotronAttention(nn.Module):
 
     def forward(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[JetNemotronCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        if self.sliding_window is not None and self.config._attn_implementation != "flash_attention_2":            
-            attention_mask = self._update_causal_mask_for_sliding_window(attention_mask, hidden_states, past_key_value)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            state = past_key_value.update(
-                attn_state=(key_states, value_states), layer_idx=self.layer_idx, 
-                offset = hidden_states.shape[1],
-                cache_kwargs={"window_size": self.sliding_window})
-            key_states, value_states = state["attn_state"]
-
-        fa2_sliding_window = None
-        if self.sliding_window is not None:
-            fa2_sliding_window = self.sliding_window - 1
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa":                
-                past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
-                if self.sliding_window is None:
-                    # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-                    # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-                    # to infer the attention mask.
-                    if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                        attention_mask,
-                        inputs_embeds=hidden_states,
-                        past_key_values_length=past_seen_tokens,
-                        sliding_window=self.sliding_window,
-                        is_training=self.training,
-                    ):
-                        attention_mask = None
-
-            elif self.config._attn_implementation == "flash_attention_2":
-                if attention_mask is not None:
-                    assert len(attention_mask.shape) == 2, "Attention mask must be 2D"
-                    attention_mask = attention_mask[:, -key_states.shape[2]:]
-            else:
-                raise ValueError(
-                    f"Unsupported attention implementation: {self.config._attn_implementation}. "
-                    "Supported implementations are: eager, sdpa, flash_attention_2."
-                )
-                
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=fa2_sliding_window,  # main diff with Llama
-            **kwargs,
-        )
-
-        if self.sliding_window is not None and past_key_value is not None:
-            past_key_value.trim_attn_state(self.layer_idx, self.sliding_window)
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        
-        return attn_output, attn_weights
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class JetNemotronRMSNorm(nn.Module):
@@ -339,24 +382,51 @@ EFFICIENT_ATTENTION_CLASSES = {
 
 
 class JetNemotronDecoderLayer(nn.Module):
-    def __init__(self, config: JetNemotronConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: JetNemotronConfig,
+        layer_idx: int,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        
-        if config.layer_types[layer_idx] == "attn":
-            self.self_attn = JetNemotronAttention(config, layer_idx)
-        elif config.layer_types[layer_idx] == "swa":
+        self.layer_idx = layer_idx
+
+        layer_type = config.layer_types[layer_idx]
+        if layer_type == "attn":
+            self.self_attn = JetNemotronAttention(
+                config,
+                layer_idx,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+            )
+        elif layer_type == "swa":
             assert config.efficient_attention_config is not None, "Efficient attention config must be provided in JetNemotronConfig."
             assert "swa" in config.efficient_attention_config, (
                 "Sliding Window Attention is enabled but no `swa` configuration found in `efficient_attention_config`."
             )
-            self.self_attn = JetNemotronAttention(config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"])
+            self.self_attn = JetNemotronAttention(
+                config,
+                layer_idx,
+                sliding_window=config.efficient_attention_config["swa"]["window_size"],
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+            )
         else:
-            assert config.layer_types[layer_idx] in EFFICIENT_ATTENTION_CLASSES, (
+            assert layer_type in EFFICIENT_ATTENTION_CLASSES, (
                 f"Layer type {config.layer_types[layer_idx]} not supported. Supported types are: "
                 f"{['attn', 'swa'] + list(EFFICIENT_ATTENTION_CLASSES.keys())}"
             )
-            self.self_attn = EFFICIENT_ATTENTION_CLASSES[config.layer_types[layer_idx]](config, config.layer_types[layer_idx], layer_idx)
+            self.self_attn = EFFICIENT_ATTENTION_CLASSES[layer_type](
+                config,
+                layer_type,
+                layer_idx,
+                prefix=f"{prefix}.self_attn",
+            )
 
         self.mlp = JetNemotronMLP(config)
         self.input_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -364,46 +434,40 @@ class JetNemotronDecoderLayer(nn.Module):
 
     def forward(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        residual: Optional[torch.Tensor],
         output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-        **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        residual = hidden_states
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            
+        if output_attentions:
+            hidden_states, self_attn_weights = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                output_attentions=True,
+            )
+        else:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
 
-        hidden_states = self.input_layernorm(hidden_states)
-        
-        # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )
-                
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
+        
         outputs = (hidden_states,)
 
         if output_attentions:
             outputs += (self_attn_weights,)
 
-        return outputs
+        return outputs, residual
+
 
 
 class JetNemotronRotaryEmbedding(nn.Module):
@@ -558,142 +622,258 @@ JET_INPUTS_DOCSTRING = r"""
     "The bare Jet Nemotron Model outputting raw hidden-states without any specific head on top.",
     JET_START_DOCSTRING,
 )
-class JetNemotronModel(JetNemotronPreTrainedModel):
+class JetNemotronModel(nn.Module):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`JetNemotronDecoderLayer`]
+    vLLM-style Jet Nemotron model with Jet-specific causal mask helpers preserved.
 
-    Args:
-        config: JetNemotronConfig
+    Notes:
+      - Forward accepts optional `attention_mask` and `cache_position` to preserve Jet's mask semantics.
+      - Layers are expected to accept (positions, hidden_states, residual, attention_mask=None, cache_position=None)
+        OR a reduced signature. If your layers do not accept attention_mask/cache_position, remove these from the call.
     """
 
-    def __init__(self, config: JetNemotronConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
+    def __init__(
+        self,
+        *,
+        vllm_config,
+        prefix: str = "",
+        decoder_layer_type: type[nn.Module] = JetNemotronDecoderLayer,
+    ):
+        super().__init__()
+
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+
+        # Check sliding window consistency (same as Qwen2 check)
+        if (cache_config.sliding_window is not None
+                and hasattr(config, "max_window_layers")):
+            if config.max_window_layers < config.num_hidden_layers:
+                raise ValueError(
+                    "Sliding window for some but not all layers is not supported. "
+                    f"max_window_layers = {config.max_window_layers}, num_hidden_layers = {config.num_hidden_layers}."
+                )
+
+        self.config = config
+        self.quant_config = quant_config
         self.vocab_size = config.vocab_size
+        # Preserve attention implementation flag if exists
+        self._attn_implementation = getattr(config, "_attn_implementation", None)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [JetNemotronDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self._attn_implementation = config._attn_implementation
-        assert self._attn_implementation in ["sdpa", "flash_attention_2"]
-        self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Embedding: only on first rank (or tied last rank)
+        if get_pp_group().is_first_rank or (
+            getattr(config, "tie_word_embeddings", False) and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        # Rotary embedding instance (if needed by layers)
+        # Note: some designs compute position embeddings at model-level; we keep rotary object for compatibility.
         self.rotary_emb = JetNemotronRotaryEmbedding(config=config)
 
-        self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
-        self.post_init()
+        # Layers: pipeline-friendly construction
+        decoder_layer_type = decoder_layer_type or JetNemotronDecoderLayer
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda layer_prefix: decoder_layer_type(
+                config=config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=layer_prefix,
+            ),
+            prefix=f"{prefix}.layers",
+        )
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(["hidden_states", "residual"], config.hidden_size)
+        )
 
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
+        # Final norm only present on last pp rank
+        if get_pp_group().is_last_rank:
+            self.norm = JetNemotronRMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
+        else:
+            self.norm = PPMissingLayer()
 
-    @can_return_tuple
-    @add_start_docstrings_to_model_forward(JET_INPUTS_DOCSTRING)
+        # store cache/sliding config locally to allow mask helpers to use it if needed
+        self.cache_config = cache_config
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    # ------------------------------
+    # Forward: vLLM style but preserves Jet mask behavior
+    # ------------------------------
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        # Optional: preserve Jet transformers inputs for mask generation
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[JetNemotronCache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> BaseModelOutputWithPast:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        """
+        Args:
+            input_ids: [batch, seq_len] (used on first pp rank)
+            positions: [batch, seq_len] absolute positions (passed to layers / rotary)
+            intermediate_tensors: for non-first ranks, contains hidden_states/residual
+            inputs_embeds: optional precomputed embeddings (bypass embedding lookup)
+            attention_mask / cache_position: optional, used to build causal masks similarly to HF Jet implementation
+        Returns:
+            - IntermediateTensors for mid-pipeline ranks
+            - final hidden states on last rank
+        """
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        # --- Prepare hidden_states depending on pipeline rank ---
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            residual = None
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-            )
-            use_cache = False
+            # prepare causal mask if attention_mask is provided or Jet's attn implementation requires it
+            causal_mask = None
+            # If user did not pass cache_position, compute from sequence length (mimic HF behavior)
+            if cache_position is None:
+                # compute starting index from zero-based past length (no past in vLLM first call)
+                seq_len = hidden_states.shape[1]
+                cache_position = torch.arange(0, seq_len, device=hidden_states.device)
+            # Only prepare causal mask if attention_mask is given or attn implementation expects it
+            # This mirrors Jet transformers: some attention impls (flash_attention_2) accept None mask.
+            if attention_mask is not None or getattr(self.config, "_attn_implementation", None) == "sdpa":
+                causal_mask = self._update_causal_mask(
+                    attention_mask=attention_mask,
+                    input_tensor=hidden_states,
+                    cache_position=cache_position,
+                    past_key_values=None,  # vLLM handles cache differently; we pass None here
+                    output_attentions=output_attentions if output_attentions is not None else getattr(self.config, "output_attentions", False),
+                )
+        else:
+            assert intermediate_tensors is not None, "IntermediateTensors required on non-first pp ranks"
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+            causal_mask = None  # mid ranks typically don't recompute mask; pass None unless needed
 
-        if use_cache and past_key_values is None:
-            past_key_values = JetNemotronCache()
+        # create position embeddings to be shared across the decoder layers (if your layer expects them)
+        # If your Jet layers compute rotary inside, you can still compute position_embeddings here for convenience
+        # but we do not force its use; layers should accept positions and/or position embeddings.
+        # position_embeddings = self.rotary_emb(hidden_states, positions)  # optional - uncomment if used
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
-
-        hidden_states = inputs_embeds
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        # decoder layers
+        # --- Layer execution ---
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for layer in self.layers[self.start_layer:self.end_layer]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    partial(decoder_layer.__call__, **flash_attn_kwargs),
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
+            # If layer signature supports (positions, hidden_states, residual, attention_mask, cache_position)
+            # we pass causal_mask and cache_position. If not, you can adapt layers or remove those params.
+            try:
+                layer_call = functools.partial(
+                    layer,
+                    # positions first (vLLM-style)
+                    positions,
                 )
-            else:
-                layer_outputs = decoder_layer(
+                # Call layer expecting it returns (hidden_states, residual) OR a tuple with attn
+                hidden_states, residual = layer_call(
                     hidden_states,
+                    residual,
                     attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
                     cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
                 )
-
-            hidden_states = layer_outputs[0]
+            except TypeError:
+                # Fallback: try calling with reduced signature (positions, hidden_states, residual)
+                hidden_states, residual = layer(positions, hidden_states, residual)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                # If layer returns attention, we would need to adapt; many vLLM layers don't return it.
+                # For compatibility: you can modify layer to optionally return (hidden_states, residual, attn)
+                # Here we try to extract attn if present.
+                # (This part is best-effort; if your layer doesn't return attn, all_self_attns remains None/empty)
+                pass
 
-        hidden_states = self.norm(hidden_states)
+        # Last rank: finalize
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual
+            })
 
-        # add hidden states from the last decoder layer
+        # If RMSNorm accepts residual for fused ops, pass it; otherwise adapt to single-arg call
+        try:
+            hidden_states, _ = self.norm(hidden_states, residual)
+        except TypeError:
+            hidden_states = self.norm(hidden_states)
+
+        # attach hidden_states/attentions if the API consumer expects them
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
+        return hidden_states
+    
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        stacked_params_mapping = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            # Adjust mapping for your MLP naming (gate/up/down) if needed
+            ("gate_up_proj", "gate_proj", "gate"),
+            ("gate_up_proj", "up_proj", "up"),
+        ]
+
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: Set[str] = set()
+
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            if (self.quant_config is not None and (hasattr(self.quant_config, "get_cache_scale") and (scale_name := self.quant_config.get_cache_scale(name)))):
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0])
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
+
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                remapped_name = name.replace(weight_name, param_name)
+                if remapped_name.endswith(".bias") and remapped_name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(remapped_name, self):
+                    continue
+                param = params_dict[remapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(remapped_name)
+                break
+            else:
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+                if remapped_name is None:
+                    continue
+                if is_pp_missing_parameter(remapped_name, self):
+                    continue
+                param = params_dict[remapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(remapped_name)
+
+        return loaded_params
 
     def _update_causal_mask(
         self,
