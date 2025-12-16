@@ -317,9 +317,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
         # Initialize weights and apply final processing

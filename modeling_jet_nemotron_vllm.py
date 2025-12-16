@@ -65,15 +65,15 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
 
 
 
-from .configuration_jet_nemotron import JetNemotronConfig
-from .jet_block import JetBlock
-from .kv_cache import JetNemotronCache
+from .jetai.modeling.hf.configuration_jet_nemotron import JetNemotronConfig
+from .jetai.modeling.hf.jet_block import JetBlock
+from .jetai.modeling.hf.kv_cache import JetNemotronCache
 
 try:
-    from .dynamic_conv import DynamicShortConvolution
-    from .dconv_fwdbwd import dynamic_conv_triton_autograd
-    from .dconv_fwd_cache import dynamic_conv_triton_cache
-    from .dconv_step import causal_conv_step_triton
+    from .jetai.modeling.hf.dynamic_conv import DynamicShortConvolution
+    from .jetai.modeling.hf.dconv_fwdbwd import dynamic_conv_triton_autograd
+    from .jetai.modeling.hf.dconv_fwd_cache import dynamic_conv_triton_cache
+    from .jetai.modeling.hf.dconv_step import causal_conv_step_triton
 except ImportError:
     raise ImportError(
         "Dynamic convolution is not available. Please install the required dependencies to use this feature."
@@ -645,24 +645,16 @@ class JetNemotronModel(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
-        # Check sliding window consistency (same as Qwen2 check)
-        if (cache_config.sliding_window is not None
-                and hasattr(config, "max_window_layers")):
-            if config.max_window_layers < config.num_hidden_layers:
-                raise ValueError(
-                    "Sliding window for some but not all layers is not supported. "
-                    f"max_window_layers = {config.max_window_layers}, num_hidden_layers = {config.num_hidden_layers}."
-                )
-
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
-        # Preserve attention implementation flag if exists
-        self._attn_implementation = getattr(config, "_attn_implementation", None)
+        # JetNemotron 的 attention 实现方式
+        self._attn_implementation = config._attn_implementation
+        assert self._attn_implementation in ["sdpa", "flash_attention_2"]
 
-        # Embedding: only on first rank (or tied last rank)
+        # ------------ Embedding 支持 TP ------------
         if get_pp_group().is_first_rank or (
-            getattr(config, "tie_word_embeddings", False) and get_pp_group().is_last_rank
+            config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -673,35 +665,38 @@ class JetNemotronModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # Rotary embedding instance (if needed by layers)
-        # Note: some designs compute position embeddings at model-level; we keep rotary object for compatibility.
+        # ------------ Rotary embedding ------------
+        # 和 Qwen2 一样放 model 这里，而不是 layer 里
         self.rotary_emb = JetNemotronRotaryEmbedding(config=config)
 
-        # Layers: pipeline-friendly construction
+        # ------------ 构造 decoder layers（带 pp, tp）------------
         decoder_layer_type = decoder_layer_type or JetNemotronDecoderLayer
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda layer_prefix: decoder_layer_type(
+            lambda prefix: decoder_layer_type(
                 config=config,
                 cache_config=cache_config,
                 quant_config=quant_config,
-                prefix=layer_prefix,
+                prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
         )
 
+        # ------------ residual/hidden pre-allocation（vLLM 需要）------------
         self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(["hidden_states", "residual"], config.hidden_size)
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], config.hidden_size
+            )
         )
 
-        # Final norm only present on last pp rank
+        # ------------ Final RMSNorm（pipeline last stage only）------------
         if get_pp_group().is_last_rank:
-            self.norm = JetNemotronRMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
+            self.norm = JetNemotronRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         else:
             self.norm = PPMissingLayer()
 
-        # store cache/sliding config locally to allow mask helpers to use it if needed
-        self.cache_config = cache_config
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
