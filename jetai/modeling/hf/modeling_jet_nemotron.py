@@ -359,6 +359,7 @@ class JetNemotronAttention(nn.Module):
             fa2_sliding_window = self.sliding_window - 1
 
         attention_interface: Callable = eager_attention_forward
+        print("------------------------------",self.config._attn_implementation,"------------------------------")
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa":                
                 past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
@@ -678,7 +679,7 @@ class JetNemotronModel(JetNemotronPreTrainedModel):
             [JetNemotronDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
-        assert self._attn_implementation in ["sdpa", "flash_attention_2"]
+        # assert self._attn_implementation in ["sdpa", "flash_attention_2"]
         self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = JetNemotronRotaryEmbedding(config=config)
 

@@ -49,6 +49,16 @@ class JetNemotronCache(transformers.cache_utils.Cache):
 
     def __len__(self):
         return len(self.states)
+    
+    @property
+    def layers(self):
+        # Transformers expects .layers to exist
+        return self.states
+
+    @property
+    def is_compileable(self) -> bool:
+        # Jet cache不支持 torch.compile，直接返回 False
+        return False
 
     def update(
         self,
