@@ -24,7 +24,7 @@ processed_data
 # model
 checkpoints/
 *.safetensors
-jetai/modeling/hf/config.json
+# jetai/modeling/hf/config.json
 jetai/modeling/hf/model.safetensors.index.json
 
 # logs
