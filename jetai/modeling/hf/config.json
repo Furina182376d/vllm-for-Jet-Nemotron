@@ -1,6 +1,6 @@
 {
   "architectures": [
-    "JetNemotronForCausalLM"
+    "NemotronForCausalLM"
   ],
   "attention_dropout": 0.0,
   "auto_map": {

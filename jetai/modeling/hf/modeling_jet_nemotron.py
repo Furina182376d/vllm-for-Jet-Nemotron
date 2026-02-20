@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,1061 +12,658 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# SPDX-License-Identifier: Apache-2.0
 
-# This file is modified from https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py
-
-from functools import partial, wraps
-from typing import Callable, Optional, Tuple, Union, Any, TypedDict
+from collections.abc import Iterable
+from itertools import islice
+from typing import Any, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
-from transformers.activations import ACT2FN
-from transformers.generation import GenerationMixin, GenerationConfig
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
+from vllm.attention.backends.abstract import AttentionType
+from vllm.attention.layer import Attention
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel, ALL_ATTENTION_FUNCTIONS
-from transformers.processing_utils import Unpack
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    can_return_tuple,
-    logging,
-    replace_return_docstrings,
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
 )
-from transformers.utils.deprecation import deprecate_kwarg
-
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
+from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.config import set_default_rope_theta
 
 from .configuration_jet_nemotron import JetNemotronConfig
-from .jet_block import JetBlock
-from .kv_cache import JetNemotronCache
+from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
+from .utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    extract_layer_index,
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+    maybe_prefix,
+)
 
-try:
-    from .dynamic_conv import DynamicShortConvolution
-    from .dconv_fwdbwd import dynamic_conv_triton_autograd
-    from .dconv_fwd_cache import dynamic_conv_triton_cache
-    from .dconv_step import causal_conv_step_triton
-except ImportError:
-    raise ImportError(
-        "Dynamic convolution is not available. Please install the required dependencies to use this feature."
-    )
-
-logger = logging.get_logger(__name__)
-
-_CHECKPOINT_FOR_DOC = "jet-ai/Jet-Nemotron-2B"
-_CONFIG_FOR_DOC = "JetNemotronConfig"
-
-class LossKwargs(TypedDict, total=False):
-    """
-    Keyword arguments to be passed to the loss function
-
-    Attributes:
-        num_items_in_batch (`Optional[torch.Tensor]`, *optional*):
-            Number of items in the batch. It is recommended to pass it when
-            you are doing gradient accumulation.
-    """
-
-    num_items_in_batch: Optional["torch.Tensor"]
-
-            
-def is_timm_config_dict(config_dict: dict[str, Any]) -> bool:
-    """Checks whether a config dict is a timm config dict."""
-    return "pretrained_cfg" in config_dict
-
-    
-def is_timm_local_checkpoint(pretrained_model_path: str) -> bool:
-    """
-    Checks whether a checkpoint is a timm model checkpoint.
-    """
-    if pretrained_model_path is None:
-        return False
-
-    # in case it's Path, not str
-    pretrained_model_path = str(pretrained_model_path)
-
-    is_file = os.path.isfile(pretrained_model_path)
-    is_dir = os.path.isdir(pretrained_model_path)
-
-    # pretrained_model_path is a file
-    if is_file and pretrained_model_path.endswith(".json"):
-        with open(pretrained_model_path) as f:
-            config_dict = json.load(f)
-        return is_timm_config_dict(config_dict)
-
-    # pretrained_model_path is a directory with a config.json
-    if is_dir and os.path.exists(os.path.join(pretrained_model_path, "config.json")):
-        with open(os.path.join(pretrained_model_path, "config.json")) as f:
-            config_dict = json.load(f)
-        return is_timm_config_dict(config_dict)
-
-    return False
-
-
-def set_attribute_for_modules(module: "torch.nn.Module", key: str, value: Any):
-    """
-    Set a value to a module and all submodules.
-    """
-    setattr(module, key, value)
-    for submodule in module.children():
-        set_attribute_for_modules(submodule, key, value)
-
-
-def del_attribute_from_modules(module: "torch.nn.Module", key: str):
-    """
-    Delete a value from a module and all submodules.
-    """
-    # because we might remove it previously in case it's a shared module, e.g. activation function
-    if hasattr(module, key):
-        delattr(module, key)
-
-    for submodule in module.children():
-        del_attribute_from_modules(submodule, key)
-
-
-def can_return_tuple(func):
-    """
-    Decorator to wrap model method, to call output.to_tuple() if return_dict=False passed as a kwarg or
-    use_return_dict=False is set in the config.
-
-    Note:
-        output.to_tuple() convert output to tuple skipping all `None` values.
-    """
-
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        is_requested_to_return_tuple = kwargs.pop("return_dict", True) is False
-        is_configured_to_return_tuple = self.config.use_return_dict is False if hasattr(self, "config") else False
-
-        # The following allows to convert output to tuple ONLY on top level forward call,
-        # while internal modules of the model will return Output objects
-        # to be able to use name-based attribute access in modeling code.
-
-        # We will check if we are on top level module, if so, turn off to tuple conversion for all
-        # underling calls.
-        is_top_level_module = getattr(self, "_is_top_level_module", True)
-        if is_configured_to_return_tuple and is_top_level_module:
-            set_attribute_for_modules(self, "_is_top_level_module", False)
-
-        try:
-            output = func(self, *args, **kwargs)
-            if is_requested_to_return_tuple or (is_configured_to_return_tuple and is_top_level_module):
-                output = output.to_tuple()
-        finally:
-            # Remove the flag after the model forward call is finished.
-            if is_configured_to_return_tuple and is_top_level_module:
-                del_attribute_from_modules(self, "_is_top_level_module")
-
-        return output
-
-    return wrapper
 
 class JetNemotronMLP(nn.Module):
-    def __init__(self, config: JetNemotronConfig):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+            )
+        self.act_fn = SiluAndMul()
 
-    def forward(self, hidden_state):
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
 class JetNemotronAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: JetNemotronConfig, layer_idx: Optional[int] = None, sliding_window: Optional[int] = None):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_parameters: dict[str, Any],
+        max_position: int = 4096 * 32,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        attn_type: str = AttentionType.DECODER,
+        sliding_window: Optional[int] = None,
+        layer_idx: Optional[int] = None,
+    ) -> None:
         super().__init__()
-        self.config = config
+        self.hidden_size = hidden_size
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+            
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
         self.sliding_window = sliding_window
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        self.num_key_value_groups = num_heads // num_kv_heads
 
-    def _get_target_length(
-        self,
-        sequence_length: int,
-        past_key_values: JetNemotronCache,
-    ):
-        past_seen_tokens = past_key_values.get_seq_length(self.layer_idx) if past_key_values is not None else 0
-        target_length = sequence_length + min(past_seen_tokens, self.sliding_window - 1)
-        return target_length
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
 
-    def _update_causal_mask_for_sliding_window(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        past_key_values: JetNemotronCache,
-    ) -> torch.Tensor:
-
-        dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.finfo(dtype).min
-        sequence_length = input_tensor.shape[1]
-
-        target_length = self._get_target_length(sequence_length, past_key_values)
-
-        past_seen_tokens = past_key_values.get_seq_length(self.layer_idx) if past_key_values is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + sequence_length, device=input_tensor.device
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position,
+            rope_parameters=rope_parameters,
         )
         
-        if attention_mask is not None:
-            # left padding
-            assert attention_mask.dim() == 4, "Attention mask must be 4D"
-            diagonal_attend_mask = attention_mask < -1
-            diagonal_attend_mask = diagonal_attend_mask[:, :, :, -target_length:]
-        else:
-            diagonal_attend_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-            diagonal_attend_mask = diagonal_attend_mask[None, None, :, :]
-                
-        if past_key_values is None or target_length > self.sliding_window:
-            # training mode or prefill mode when dealing with long prefix)
-            sliding_attend_mask = torch.arange(past_seen_tokens + sequence_length, device=device)[-target_length:] <= (
-                cache_position.reshape(-1, 1) - self.sliding_window
-            ) # bs, sequence_length, target_length
-            sliding_attend_mask = sliding_attend_mask[None, None, :, :]            
-            
-            diagonal_attend_mask = diagonal_attend_mask | sliding_attend_mask
-
-        # training
-        causal_mask = torch.full(
-            (1, 1, sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            attn_type=attn_type,
+            prefix=f"{prefix}.attn",
+            sliding_window=sliding_window,
+            layer_idx=layer_idx,
         )
-        causal_mask = causal_mask * diagonal_attend_mask
-        causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
-
-        return causal_mask
 
     def forward(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[JetNemotronCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
 
-        if self.sliding_window is not None and self.config._attn_implementation != "flash_attention_2":            
-            attention_mask = self._update_causal_mask_for_sliding_window(attention_mask, hidden_states, past_key_value)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            state = past_key_value.update(
-                attn_state=(key_states, value_states), layer_idx=self.layer_idx, 
-                offset = hidden_states.shape[1],
-                cache_kwargs={"window_size": self.sliding_window})
-            key_states, value_states = state["attn_state"]
-
-        fa2_sliding_window = None
-        if self.sliding_window is not None:
-            fa2_sliding_window = self.sliding_window - 1
-
-        attention_interface: Callable = eager_attention_forward
-        print("------------------------------",self.config._attn_implementation,"------------------------------")
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa":                
-                past_seen_tokens = past_key_value.get_seq_length() if past_key_value is not None else 0
-                if self.sliding_window is None:
-                    # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-                    # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-                    # to infer the attention mask.
-                    if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                        attention_mask,
-                        inputs_embeds=hidden_states,
-                        past_key_values_length=past_seen_tokens,
-                        sliding_window=self.sliding_window,
-                        is_training=self.training,
-                    ):
-                        attention_mask = None
-
-            elif self.config._attn_implementation == "flash_attention_2":
-                if attention_mask is not None:
-                    assert len(attention_mask.shape) == 2, "Attention mask must be 2D"
-                    attention_mask = attention_mask[:, -key_states.shape[2]:]
-            else:
-                raise ValueError(
-                    f"Unsupported attention implementation: {self.config._attn_implementation}. "
-                    "Supported implementations are: eager, sdpa, flash_attention_2."
-                )
-                
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=fa2_sliding_window,  # main diff with Llama
-            **kwargs,
+class DynamicShortConvolutionVLLM(nn.Module):
+    """vLLM适配的动态卷积层"""
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int = 4,
+        activation: str = "silu",
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.kernel_size = kernel_size
+        
+        try:
+            from .dynamic_conv import DynamicShortConvolution
+            from .dconv_fwdbwd import dynamic_conv_triton_autograd
+            from .dconv_fwd_cache import dynamic_conv_triton_cache
+            from .dconv_step import causal_conv_step_triton
+            
+            # 使用原始的DynamicShortConvolution
+            self.conv = DynamicShortConvolution(
+                hidden_size,
+                kernel_size,
+            )
+            
+            # 保存函数引用以便在forward中使用
+            self.dynamic_conv_triton_autograd = dynamic_conv_triton_autograd
+            self.dynamic_conv_triton_cache = dynamic_conv_triton_cache
+            self.causal_conv_step_triton = causal_conv_step_triton
+            
+        except ImportError:
+            raise ImportError(
+                "Dynamic convolution is not available. Please install the required dependencies to use this feature."
+            )
+        
+        # 激活函数
+        if activation == "silu":
+            self.act_fn = nn.SiLU()
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+            
+        # 输出投影层
+        self.output_proj = RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.output_proj",
         )
 
-        if self.sliding_window is not None and past_key_value is not None:
-            past_key_value.trim_attn_state(self.layer_idx, self.sliding_window)
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 应用动态卷积
+        x = self.conv(x)
         
-        return attn_output, attn_weights
-
-
-class JetNemotronRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        JetNemotronRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states).to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
-EFFICIENT_ATTENTION_CLASSES = {
-    "jet": JetBlock,
-}
+        # 激活函数
+        x = self.act_fn(x)
+        
+        # 输出投影
+        x, _ = self.output_proj(x)
+        
+        return x
 
 
 class JetNemotronDecoderLayer(nn.Module):
-    def __init__(self, config: JetNemotronConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: JetNemotronConfig,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        layer_idx: int = 0,
+    ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
+        self.layer_type = config.layer_types[layer_idx] if hasattr(config, 'layer_types') else "attn"
         
-        if config.layer_types[layer_idx] == "attn":
-            self.self_attn = JetNemotronAttention(config, layer_idx)
-        elif config.layer_types[layer_idx] == "swa":
-            assert config.efficient_attention_config is not None, "Efficient attention config must be provided in JetNemotronConfig."
-            assert "swa" in config.efficient_attention_config, (
-                "Sliding Window Attention is enabled but no `swa` configuration found in `efficient_attention_config`."
+        set_default_rope_theta(config, default_theta=1000000)
+        
+        # 初始化注意力或动态卷积层
+        if self.layer_type in ["attn", "swa"]:
+            # 标准注意力或滑动窗口注意力
+            sliding_window = None
+            if self.layer_type == "swa":
+                if hasattr(config, 'efficient_attention_config') and config.efficient_attention_config:
+                    swa_config = config.efficient_attention_config.get("swa", {})
+                    sliding_window = swa_config.get("window_size")
+            
+            self.self_attn = JetNemotronAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                max_position=config.max_position_embeddings,
+                rope_parameters=getattr(config, "rope_parameters", {}),
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+                sliding_window=sliding_window,
+                layer_idx=layer_idx,
             )
-            self.self_attn = JetNemotronAttention(config, layer_idx, sliding_window=config.efficient_attention_config["swa"]["window_size"])
+            self.dynamic_conv = None
+        elif self.layer_type == "jet":
+            # JetBlock (需要适配)
+            from .jet_block import JetBlock
+            self.self_attn = JetBlock(
+                config=config,
+                layer_idx=layer_idx,
+                # 这里需要传递vLLM相关参数
+            )
+            self.dynamic_conv = None
         else:
-            assert config.layer_types[layer_idx] in EFFICIENT_ATTENTION_CLASSES, (
-                f"Layer type {config.layer_types[layer_idx]} not supported. Supported types are: "
-                f"{['attn', 'swa'] + list(EFFICIENT_ATTENTION_CLASSES.keys())}"
+            # 动态卷积层
+            self.self_attn = None
+            kernel_size = 4
+            if hasattr(config, 'efficient_attention_config') and config.efficient_attention_config:
+                dconv_config = config.efficient_attention_config.get("dynamic_conv", {})
+                kernel_size = dconv_config.get("kernel_size", 4)
+            
+            self.dynamic_conv = DynamicShortConvolutionVLLM(
+                hidden_size=config.hidden_size,
+                kernel_size=kernel_size,
+                activation=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.dynamic_conv",
             )
-            self.self_attn = EFFICIENT_ATTENTION_CLASSES[config.layer_types[layer_idx]](config, config.layer_types[layer_idx], layer_idx)
-
-        self.mlp = JetNemotronMLP(config)
-        self.input_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # MLP层
+        self.mlp = JetNemotronMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        
+        # LayerNorm层
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        
+        # 用于动态卷积的额外LayerNorm
+        self.post_conv_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        ) if self.layer_type not in ["attn", "swa", "jet"] else None
 
     def forward(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-        **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-        
-        # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-        )
-                
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        return outputs
-
-
-class JetNemotronRotaryEmbedding(nn.Module):
-    def __init__(self, config: JetNemotronConfig, device=None):
-        super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        residual: torch.Tensor | None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.self_attn is not None:
+            # 注意力层（标准、滑动窗口或JetBlock）
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            
+            # 应用注意力
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            
+            # MLP部分
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
         else:
-            self.rope_type = "default"
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
+            # 动态卷积层
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            
+            # 应用动态卷积
+            hidden_states = self.dynamic_conv(hidden_states)
+            
+            # MLP部分
+            hidden_states, residual = self.post_conv_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
+        
+        return hidden_states, residual
+
+
+def jet_nemotron_model_invariants(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+):
+    """Shape invariants for JetNemotronModel, translated to runtime assertions"""
+    torch._check(input_ids.size()[0] == positions.size()[-1])
+    
+    if intermediate_tensors is not None:
+        torch._check(
+            input_ids.size()[0] == intermediate_tensors["hidden_states"].size()[0]
+        )
+
+    if inputs_embeds is not None:
+        torch._check(input_ids.size()[0] == inputs_embeds.size()[0])
+
+    if inputs_embeds is not None and intermediate_tensors is not None:
+        torch._check(
+            inputs_embeds.size()[1] == intermediate_tensors["hidden_states"].size()[1]
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    },
+    shape_invariants=jet_nemotron_model_invariants,
+)
+class JetNemotronModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
-
-    @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-JET_START_DOCSTRING = r"""
-    This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
-    library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
-    etc.)
-
-    This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
-    Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
-    and behavior.
-
-    Parameters:
-        config ([`JetNemotronConfig`]):
-            Model configuration class with all the parameters of the model. Initializing with a config file does not
-            load the weights associated with the model, only the configuration. Check out the
-            [`~PreTrainedModel.from_pretrained`] method to load the model weights.
-"""
-
-
-@add_start_docstrings(
-    "The bare Jet-Nemotron Model outputting raw hidden-states without any specific head on top.",
-    JET_START_DOCSTRING,
-)
-class JetNemotronPreTrainedModel(PreTrainedModel):
-    config_class = JetNemotronConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["JetNemotronDecoderLayer"]
-    _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
-    _supports_sdpa = True
-    _supports_flex_attn = False
-    _supports_cache_class = True
-    _supports_quantized_cache = False
-    _supports_static_cache = False
-    _supports_attention_backend = True
-
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-
-
-JET_INPUTS_DOCSTRING = r"""
-    Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
-            it.
-
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-
-            [What are input IDs?](../glossary#input-ids)
-        attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-
-            [What are attention masks?](../glossary#attention-mask)
-
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-
-            If `past_key_values` is used, optionally only the last `input_ids` have to be input (see
-            `past_key_values`).
-
-            If you want to change padding behavior, you should read [`modeling_opt._prepare_decoder_attention_mask`]
-            and modify to your needs. See diagram 1 in [the paper](https://arxiv.org/abs/1910.13461) for more
-            information on the default strategy.
-
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-        position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
-            config.n_positions - 1]`.
-
-            [What are position IDs?](../glossary#position-ids)
-        past_key_values (`Cache`, *optional*):
-            Pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
-            blocks) that can be used to speed up sequential decoding. This typically consists in the `past_key_values`
-            returned by the model at a previous stage of decoding, when `use_cache=True` or `config.use_cache=True`.
-
-            It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
-
-            If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that don't
-            have their past key value states given to this model) of shape `(batch_size, 1)` instead of all `input_ids`
-            of shape `(batch_size, sequence_length)`.
-        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
-            is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
-            model's internal embedding lookup matrix.
-        use_cache (`bool`, *optional*):
-            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
-            `past_key_values`).
-        output_attentions (`bool`, *optional*):
-            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
-            tensors for more detail.
-        output_hidden_states (`bool`, *optional*):
-            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
-            more detail.
-        return_dict (`bool`, *optional*):
-            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
-        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-            Indices depicting the position of the input sequence tokens in the sequence. Contrarily to `position_ids`,
-            this tensor is not affected by padding. It is used to update the cache in the correct position and to infer
-            the complete sequence length.
-"""
-
-
-@add_start_docstrings(
-    "The bare Jet Nemotron Model outputting raw hidden-states without any specific head on top.",
-    JET_START_DOCSTRING,
-)
-class JetNemotronModel(JetNemotronPreTrainedModel):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`JetNemotronDecoderLayer`]
-
-    Args:
-        config: JetNemotronConfig
-    """
-
-    def __init__(self, config: JetNemotronConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        self.quant_config = quant_config
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [JetNemotronDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self._attn_implementation = config._attn_implementation
-        # assert self._attn_implementation in ["sdpa", "flash_attention_2"]
-        self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = JetNemotronRotaryEmbedding(config=config)
-
-        self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
-
-    @can_return_tuple
-    @add_start_docstrings_to_model_forward(JET_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[JetNemotronCache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> BaseModelOutputWithPast:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-            )
-            use_cache = False
-
-        if use_cache and past_key_values is None:
-            past_key_values = JetNemotronCache()
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
-
-        hidden_states = inputs_embeds
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    partial(decoder_layer.__call__, **flash_attn_kwargs),
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
-                )
-
-            hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        hidden_states = self.norm(hidden_states)
-
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
-
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: JetNemotronCache,
-        output_attentions: bool,
-    ):
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and past_key_values is not None:
-                is_empty = attention_mask.sum(dim=-1).long() == 0
-                last_is_1 = (attention_mask[:, -1].long() == 1) | is_empty
-                is_padding_right = last_is_1.sum().item() != input_tensor.size()[0]
-                if is_padding_right:
-                    raise ValueError(
-                        "You are attempting to perform batched generation with padding_side='right'"
-                        " this may lead to unexpected behaviour for Flash Attention version of Jet-Nemotron. Make sure to "
-                        " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
-                    )
-            if attention_mask is not None and 0.0 in attention_mask:
-                return attention_mask
-            return None
-
-        if self.config._attn_implementation == "flex_attention":
-            raise NotImplementedError(
-                "Flex attention is not supported yet. Please use `flash_attention_2`, `eager`, or `sdpa` instead."
-            )
-
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.finfo(dtype).min
-        sequence_length = input_tensor.shape[1]
-
-        target_length = (
-            attention_mask.shape[-1]
-            if isinstance(attention_mask, torch.Tensor)
-            else past_seen_tokens + sequence_length + 1
-        )
-
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
-            config=self.config,
-            past_key_values=past_key_values,
-        )
-
-        if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type == "cuda"
-            and not output_attentions
+        if get_pp_group().is_first_rank or (
+            hasattr(config, 'tie_word_embeddings') and config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
-            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
-            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
-            # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
-
-        return causal_mask
-
-    @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
-        cache_position: torch.Tensor,
-        batch_size: int,
-        config: JetNemotronConfig,
-        past_key_values: JetNemotronCache,
-    ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache, to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-            config (`JetNemotronConfig`):
-                The model's configuration class
-            past_key_values (`Cache`):
-                The cache class that is being used currently to generate
-        """
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
         else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
-            )
-            diagonal_attend_mask = torch.arange(target_length, device=cache_position.device) > cache_position.reshape(
-                -1, 1
-            )
-            causal_mask *= diagonal_attend_mask
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                if attention_mask.shape[-1] > target_length:
-                    attention_mask = attention_mask[:, :target_length]
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
-                    causal_mask.device
-                )
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
-        return causal_mask
+            self.embed_tokens = PPMissingLayer()
 
-class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
+        # 创建解码器层
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: JetNemotronDecoderLayer(
+                config=config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+                layer_idx=idx,
+            ),
+            prefix=f"{prefix}.layers",
+        )
 
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
+        
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
-class JetNemotronForCausalLM(JetNemotronPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
-    _tp_plan = {"lm_head": "colwise_rep"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+        self.aux_hidden_state_layers = tuple[int, ...]()
 
-    def __init__(self, config: JetNemotronConfig):
-        super().__init__(config)
-        self.model = JetNemotronModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def set_decoder(self, decoder):
-        self.model = decoder
-
-    def get_decoder(self):
-        return self.model
-
-    @can_return_tuple
-    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
-    @add_start_docstrings_to_model_forward(JET_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[JetNemotronCache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
-    ) -> CausalLMOutputWithPast:
-        r"""
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
 
-            logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
+        aux_hidden_states = []
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
+            hidden_states, residual = layer(positions, hidden_states, residual)
 
-        Returns:
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
 
-        Example:
+        hidden_states, _ = self.norm(hidden_states, residual)
 
-        ```python
-        >>> from transformers import AutoTokenizer, AutoModelForCausalLM
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
 
-        >>> model = AutoModelForCausalLM.from_pretrained("jet-ai/Jet-Nemotron-2B")
-        >>> tokenizer = AutoTokenizer.from_pretrained("jet-ai/Jet-Nemotron-2B")
+        return hidden_states
 
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+        
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+                
+            # 处理量化缩放因子
+            if self.quant_config is not None and (
+                scale_name := self.quant_config.get_cache_scale(name)
+            ):
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                loaded_weight = (
+                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
+                )
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
+                
+            # 动态卷积层的权重加载
+            if "dynamic_conv" in name:
+                # 动态卷积层可能有不同的参数名
+                param_name = name.replace("conv.", "dynamic_conv.conv.")
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(param_name)
+                    continue
+            
+            # JetBlock的权重加载
+            if "jet_block" in name or "jet." in name:
+                # 可能需要特殊处理
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+                    continue
+            
+            # 标准权重加载
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # 跳过GPTQ模型的额外偏置
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if name.endswith("scale"):
+                    # 重映射FP8 kv-scale的名称
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                if weight_loader == default_weight_loader:
+                    weight_loader(param, loaded_weight)
+                else:
+                    weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # 跳过GPTQ模型的额外偏置
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # 重映射FP8 kv-scale的名称
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+            
+        return loaded_params
 
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+
+class JetNemotronForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+
+        self.config = config
+        self.quant_config = quant_config
+        
+        self.model = JetNemotronModel(
+            vllm_config=vllm_config, 
+            prefix=maybe_prefix(prefix, "model")
         )
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        if get_pp_group().is_last_rank:
+            if hasattr(config, 'tie_word_embeddings') and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
+        else:
+            self.lm_head = PPMissingLayer()
 
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
 
-    # transformers <=4.53 takes device argument at this end but this is removed in 4.57.1
-    def _prepare_cache_for_generation(
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def forward(
         self,
-        generation_config: GenerationConfig,
-        model_kwargs: dict,
-        assistant_model: "PreTrainedModel",
-        batch_size: int,
-        max_cache_length: int,
-        *args,
-    ) -> bool:
-        assert not generation_config.return_legacy_cache, "Legacy cache is not supported for generation."
-        if generation_config.use_cache is False:
-            return
-        model_kwargs["past_key_values"] = JetNemotronCache()
-    
-    def _beam_search(self, *args, **kwargs):
-        raise NotImplementedError("Beam search is not supported for Jet-Nemotron models.")
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        hidden_states = self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        return hidden_states
 
-    def _contrastive_search(self, *args, **kwargs):
-        raise NotImplementedError("Contrastive search is not supported for Jet-Nemotron models.")
-    
-    def _group_beam_search(self, *args, **kwargs):
-        raise NotImplementedError("Group beam search is not supported for Jet-Nemotron models.")
-    
-    def _constrained_beam_search(self, *args, **kwargs):
-        raise NotImplementedError("Constrained beam search is not supported for Jet-Nemotron models.")
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(
+                ["lm_head."] if hasattr(self.config, 'tie_word_embeddings') and self.config.tie_word_embeddings 
+                else None
+            ),
+        )
+        return loader.load_weights(weights)
