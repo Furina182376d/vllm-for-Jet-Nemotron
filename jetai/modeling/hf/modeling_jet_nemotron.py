@@ -432,16 +432,19 @@ class JetNemotronModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # 创建解码器层
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: JetNemotronDecoderLayer(
+        def layer_fn(prefix: str):
+            layer_idx = extract_layer_index(prefix)
+            return JetNemotronDecoderLayer(
                 config=config,
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
-                layer_idx=idx,
-            ),
+                layer_idx=layer_idx,
+            )
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            layer_fn,
             prefix=f"{prefix}.layers",
         )
 

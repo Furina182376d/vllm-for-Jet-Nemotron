@@ -802,12 +802,12 @@ def sequence_parallel_chunk_impl_fake(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-direct_register_custom_op(
-    op_name="sequence_parallel_chunk_impl",
-    op_func=sequence_parallel_chunk_impl,
-    fake_impl=sequence_parallel_chunk_impl_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
+# direct_register_custom_op(
+#     op_name="sequence_parallel_chunk_impl",
+#     op_func=sequence_parallel_chunk_impl,
+#     fake_impl=sequence_parallel_chunk_impl_fake,
+#     tags=(torch.Tag.needs_fixed_stride_order,),
+# )
 
 
 def process_eagle_weight(
