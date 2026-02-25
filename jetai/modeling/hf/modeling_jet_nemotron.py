@@ -44,7 +44,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.config import set_default_rope_theta
+# from vllm.transformers_utils.config import set_default_rope_theta
 
 from .configuration_jet_nemotron import JetNemotronConfig
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
@@ -57,6 +57,35 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+import inspect
+from vllm.compilation.decorators import support_torch_compile
+
+_SUPPORTS_SHAPE_INVARIANTS = (
+    "shape_invariants" in inspect.signature(support_torch_compile).parameters
+)
+
+class JetBlockAttentionAdapter(nn.Module):
+    def __init__(self, jet_block: nn.Module):
+        super().__init__()
+        self.jet_block = jet_block
+
+    def forward(
+        self,
+        positions: torch.Tensor,        # ← 吃掉，但不用
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Any] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        # 直接转给 JetBlock
+        o, _, past_key_value = self.jet_block(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
+        return o, None, past_key_value
 
 
 class JetNemotronMLP(nn.Module):
@@ -150,11 +179,23 @@ class JetNemotronAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        base = 10000
+        rope_scaling = None
+
+        if rope_parameters:
+            if "theta" in rope_parameters:
+                base = rope_parameters["theta"]
+            elif "rope_theta" in rope_parameters:
+                base = rope_parameters["rope_theta"]
+
+            rope_scaling = rope_parameters.get("rope_scaling", None)
+
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
+            rotary_dim=self.head_dim, 
             max_position=max_position,
-            rope_parameters=rope_parameters,
+            base=base,
+            rope_scaling=rope_scaling,
         )
         
         self.attn = Attention(
@@ -166,8 +207,7 @@ class JetNemotronAttention(nn.Module):
             quant_config=quant_config,
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
-            sliding_window=sliding_window,
-            layer_idx=layer_idx,
+            per_layer_sliding_window=sliding_window,
         )
 
     def forward(
@@ -261,7 +301,7 @@ class JetNemotronDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, 'layer_types') else "attn"
         
-        set_default_rope_theta(config, default_theta=1000000)
+        # set_default_rope_theta(config, default_theta=1000000)
         
         # 初始化注意力或动态卷积层
         if self.layer_type in ["attn", "swa"]:
@@ -286,12 +326,12 @@ class JetNemotronDecoderLayer(nn.Module):
             )
             self.dynamic_conv = None
         elif self.layer_type == "jet":
-            # JetBlock (需要适配)
             from .jet_block import JetBlock
-            self.self_attn = JetBlock(
-                config=config,
-                layer_idx=layer_idx,
-                # 这里需要传递vLLM相关参数
+            self.self_attn = JetBlockAttentionAdapter(
+                JetBlock(
+                    config=config,
+                    layer_idx=layer_idx,
+                )
             )
             self.dynamic_conv = None
         else:
@@ -345,7 +385,7 @@ class JetNemotronDecoderLayer(nn.Module):
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
             
             # 应用注意力
-            hidden_states = self.self_attn(
+            hidden_states, _, past_key_value = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
             )
@@ -394,15 +434,28 @@ def jet_nemotron_model_invariants(
         )
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-    },
-    shape_invariants=jet_nemotron_model_invariants,
-)
+if _SUPPORTS_SHAPE_INVARIANTS:
+    JetNemotronModelBase = support_torch_compile(
+        dynamic_arg_dims={
+            "input_ids": 0,
+            "positions": -1,
+            "intermediate_tensors": 0,
+            "inputs_embeds": 0,
+        },
+        shape_invariants=jet_nemotron_model_invariants,
+    )
+else:
+    JetNemotronModelBase = support_torch_compile(
+        dynamic_arg_dims={
+            "input_ids": 0,
+            "positions": -1,
+            "intermediate_tensors": 0,
+            "inputs_embeds": 0,
+        }
+    )
+
+
+@JetNemotronModelBase
 class JetNemotronModel(nn.Module):
     def __init__(
         self,
@@ -515,11 +568,16 @@ class JetNemotronModel(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-                
+            
+            if not name.startswith("model.") and f"model.{name}" in params_dict:
+                name = f"model.{name}"
+
             # 处理量化缩放因子
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
+                if scale_name not in params_dict:
+                    continue
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 loaded_weight = (
@@ -528,7 +586,7 @@ class JetNemotronModel(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(scale_name)
                 continue
-                
+
             # 动态卷积层的权重加载
             if "dynamic_conv" in name:
                 # 动态卷积层可能有不同的参数名
@@ -538,55 +596,67 @@ class JetNemotronModel(nn.Module):
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(param_name)
-                    continue
-            
-            # JetBlock的权重加载
+                continue
+
+            # ===== Jet block =====
             if "jet_block" in name or "jet." in name:
-                # 可能需要特殊处理
                 if name in params_dict:
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
-                    continue
-            
-            # 标准权重加载
+                continue
+
+            # ===== qkv / gate_up 堆叠参数 =====
+            stacked_loaded = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                # 跳过GPTQ模型的额外偏置
-                if name.endswith(".bias") and name not in params_dict:
+
+                merged_name = name.replace(weight_name, param_name)
+
+                if merged_name.endswith(".bias") and merged_name not in params_dict:
                     continue
-                if is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(merged_name, self):
                     continue
-                if name.endswith("scale"):
-                    # 重映射FP8 kv-scale的名称
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
+                if merged_name.endswith("scale"):
+                    merged_name = maybe_remap_kv_scale_name(merged_name, params_dict)
+                    if merged_name is None:
                         continue
-                param = params_dict[name]
+                if merged_name not in params_dict:
+                    continue
+
+                param = params_dict[merged_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
                 if weight_loader == default_weight_loader:
                     weight_loader(param, loaded_weight)
                 else:
                     weight_loader(param, loaded_weight, shard_id)
+
+                loaded_params.add(merged_name)
+                stacked_loaded = True
                 break
-            else:
-                # 跳过GPTQ模型的额外偏置
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # 重映射FP8 kv-scale的名称
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+
+            if stacked_loaded:
+                continue
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+
+            name = maybe_remap_kv_scale_name(name, params_dict)
+            if name is None:
+                continue
+            if is_pp_missing_parameter(name, self):
+                continue
+            if name not in params_dict:
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
             loaded_params.add(name)
-            
+
         return loaded_params
 
 

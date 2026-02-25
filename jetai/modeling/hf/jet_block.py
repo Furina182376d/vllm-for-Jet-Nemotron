@@ -258,4 +258,4 @@ class JetBlock(nn.Module):
         if attention_mask is not None and q_len > 1:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
-        return o, past_key_value
+        return o, None, past_key_value
