@@ -37,12 +37,6 @@ from .dynamic_conv import DynamicShortConvolution
 from .configuration_jet_nemotron import JetNemotronConfig
 from .kv_cache import JetNemotronCache
 
-# @dataclass
-# class IntermediateTensors:
-#     hidden_states_per_layer: Optional[List[torch.Tensor]] = None
-#     attention_key_values: Optional[List[torch.Tensor]] = None
-#     mlp_outputs: Optional[List[torch.Tensor]] = None
-
 
 @dataclass
 class JetBlockConfig():
@@ -155,12 +149,20 @@ class JetBlock(nn.Module):
 
     def forward(
         self,
+        # positions: torch.Tensor,
         hidden_states: torch.Tensor,
         past_key_value: Optional[JetNemotronCache] = None,
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         **kwargs
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[JetNemotronCache]]:
+    ) -> Tuple[torch.Tensor, None, Optional[JetNemotronCache]]:
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)
+
+        torch._assert(
+            hidden_states.dim() == 3,
+            f"hidden_states must be [B, T, D], got shape {hidden_states.shape}"
+        )
         if attention_mask is not None:
             if len(attention_mask.shape) > 2:
                 attention_mask = attention_mask.squeeze(1)
@@ -194,8 +196,9 @@ class JetBlock(nn.Module):
         conv_state = None
         if last_state is not None:
             conv_state = last_state['conv_state']
+        x = self.v_proj(hidden_states)
         v, conv_state = self.dynamic_conv1d(
-            x=self.v_proj(hidden_states),
+            x=x,
             generator_input=hidden_states,
             mask=conv_mask,
             cache=conv_state,
@@ -215,7 +218,7 @@ class JetBlock(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
-        if mode == 'chunk':
+        if mode == 'chunk' and not torch.compiler.is_compiling():
             o, recurrent_state = chunk_gated_delta_rule(
                 q=q,
                 k=k,
@@ -228,7 +231,7 @@ class JetBlock(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 autotune_interval=self.autotune_interval
             )
-        elif mode == 'fused_recurrent':
+        else:
             o, recurrent_state = fused_recurrent_gated_delta_rule(
                 q=q,
                 k=k,
@@ -240,8 +243,8 @@ class JetBlock(nn.Module):
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True
             )
-        else:
-            raise NotImplementedError(f"Not supported mode `{mode}`.")
+        # else:
+        #     raise NotImplementedError(f"Not supported mode `{mode}`.")
 
         if past_key_value is not None:
             past_key_value.update(

@@ -9,3 +9,10 @@ with safe_open(checkpoint_path, framework="pt") as f:
         print("LM head 权重存在 ✅")
     else:
         print("LM head 权重缺失 ❌")
+with safe_open(checkpoint_path, framework="pt") as f:
+    jet_keys = [k for k in f.keys() if "A_log" in k or "dynamic_conv" in k]
+    if len(jet_keys) > 0:
+        print("JetBlock-related keys found in checkpoint:")
+    else:
+        print("No JetBlock-related keys found in checkpoint.")
+    print("JetBlock-related keys:", jet_keys)

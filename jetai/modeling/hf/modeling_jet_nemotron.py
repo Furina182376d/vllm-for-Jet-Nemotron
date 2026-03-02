@@ -64,30 +64,6 @@ _SUPPORTS_SHAPE_INVARIANTS = (
     "shape_invariants" in inspect.signature(support_torch_compile).parameters
 )
 
-class JetBlockAttentionAdapter(nn.Module):
-    def __init__(self, jet_block: nn.Module):
-        super().__init__()
-        self.jet_block = jet_block
-
-    def forward(
-        self,
-        positions: torch.Tensor,        # ← 吃掉，但不用
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Any] = None,
-        use_cache: bool = False,
-        **kwargs,
-    ):
-        # 直接转给 JetBlock
-        o, _, past_key_value = self.jet_block(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-        )
-        return o, None, past_key_value
-
-
 class JetNemotronMLP(nn.Module):
     def __init__(
         self,
@@ -212,15 +188,35 @@ class JetNemotronAttention(nn.Module):
 
     def forward(
         self,
+        *,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+        cache: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        # 1. QKV
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = qkv.split(
+            [self.q_size, self.kv_size, self.kv_size], dim=-1
+        )
+
+        # 2. RoPE
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+
+        # 3. vLLM Attention
+        # ⚠️ 这里 self.attn 本身 already handles cache
+        attn_output, attn_metadata, new_cache = self.attn(
+            q,
+            k,
+            v,
+            cache=cache,
+        )
+
+        # 4. Output projection
         output, _ = self.o_proj(attn_output)
-        return output
+
+        # 5. ✅ vLLM contract
+        return output, attn_metadata, new_cache
 
 
 class DynamicShortConvolutionVLLM(nn.Module):
@@ -274,17 +270,28 @@ class DynamicShortConvolutionVLLM(nn.Module):
             prefix=f"{prefix}.output_proj",
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 应用动态卷积
-        x = self.conv(x)
-        
-        # 激活函数
+    def forward(
+        self,
+        *,
+        positions: torch.Tensor | None = None,
+        hidden_states: torch.Tensor,
+        cache: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        """
+        vLLM-compatible forward:
+        returns (output, attn_metadata, new_cache)
+        """
+        x, new_cache = self.conv(
+            hidden_states,
+            cache=cache,
+            output_final_state=False,
+        )
+
         x = self.act_fn(x)
-        
-        # 输出投影
         x, _ = self.output_proj(x)
-        
-        return x
+
+        return x, None, new_cache
 
 
 class JetNemotronDecoderLayer(nn.Module):
@@ -301,17 +308,28 @@ class JetNemotronDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, 'layer_types') else "attn"
         
-        # set_default_rope_theta(config, default_theta=1000000)
-        
         # 初始化注意力或动态卷积层
-        if self.layer_type in ["attn", "swa"]:
-            # 标准注意力或滑动窗口注意力
+        if self.layer_type == "attn":
+            self.self_attn = JetNemotronAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                max_position=config.max_position_embeddings,
+                rope_parameters=getattr(config, "rope_parameters", {}),
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+                sliding_window=None,
+                layer_idx=layer_idx,
+            )
+            self.dynamic_conv = None
+
+        elif self.layer_type == "swa":
             sliding_window = None
-            if self.layer_type == "swa":
-                if hasattr(config, 'efficient_attention_config') and config.efficient_attention_config:
-                    swa_config = config.efficient_attention_config.get("swa", {})
-                    sliding_window = swa_config.get("window_size")
-            
+            if hasattr(config, "efficient_attention_config") and config.efficient_attention_config:
+                swa_cfg = config.efficient_attention_config.get("swa", {})
+                sliding_window = swa_cfg.get("window_size")
+
             self.self_attn = JetNemotronAttention(
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -327,11 +345,10 @@ class JetNemotronDecoderLayer(nn.Module):
             self.dynamic_conv = None
         elif self.layer_type == "jet":
             from .jet_block import JetBlock
-            self.self_attn = JetBlockAttentionAdapter(
-                JetBlock(
-                    config=config,
-                    layer_idx=layer_idx,
-                )
+            self.self_attn = JetBlock(
+                config=config,
+                layer_type=self.layer_type,
+                layer_idx=layer_idx,
             )
             self.dynamic_conv = None
         else:
@@ -376,20 +393,23 @@ class JetNemotronDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         if self.self_attn is not None:
-            # 注意力层（标准、滑动窗口或JetBlock）
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
-            
-            # 应用注意力
-            hidden_states, _, past_key_value = self.self_attn(
+            out = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
             )
-            
+
+            if isinstance(out, tuple):
+                hidden_states, _, _ = out
+            else:
+                hidden_states = out
+
             # MLP部分
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
@@ -407,8 +427,8 @@ class JetNemotronDecoderLayer(nn.Module):
             # MLP部分
             hidden_states, residual = self.post_conv_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
-        
-        return hidden_states, residual
+
+        return hidden_states, None, residual
 
 
 def jet_nemotron_model_invariants(
@@ -539,7 +559,7 @@ class JetNemotronModel(nn.Module):
         ):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual, _ = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
