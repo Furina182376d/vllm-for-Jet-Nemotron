@@ -156,8 +156,10 @@ class JetBlock(nn.Module):
         use_cache: Optional[bool] = False,
         **kwargs
     ) -> Tuple[torch.Tensor, None, Optional[JetNemotronCache]]:
+        unsqueezed = False
         if hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(1)
+            hidden_states = hidden_states.unsqueeze(0)
+            unsqueezed = True
 
         torch._assert(
             hidden_states.dim() == 3,
@@ -260,5 +262,7 @@ class JetBlock(nn.Module):
         o = self.o_proj(o)
         if attention_mask is not None and q_len > 1:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
+        if unsqueezed:
+            o = o.squeeze(0)
 
         return o, None, past_key_value

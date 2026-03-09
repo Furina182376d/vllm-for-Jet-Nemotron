@@ -194,29 +194,12 @@ class JetNemotronAttention(nn.Module):
         cache: torch.Tensor | None = None,
         **kwargs,
     ):
-        # 1. QKV
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split(
-            [self.q_size, self.kv_size, self.kv_size], dim=-1
-        )
-
-        # 2. RoPE
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-
-        # 3. vLLM Attention
-        # ⚠️ 这里 self.attn 本身 already handles cache
-        attn_output, attn_metadata, new_cache = self.attn(
-            q,
-            k,
-            v,
-            cache=cache,
-        )
-
-        # 4. Output projection
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
-
-        # 5. ✅ vLLM contract
-        return output, attn_metadata, new_cache
+        return output
 
 
 class DynamicShortConvolutionVLLM(nn.Module):
@@ -438,18 +421,18 @@ def jet_nemotron_model_invariants(
     inputs_embeds: torch.Tensor | None = None,
 ):
     """Shape invariants for JetNemotronModel, translated to runtime assertions"""
-    torch._check(input_ids.size()[0] == positions.size()[-1])
+    torch._assert(input_ids.size()[0] == positions.size()[-1])
     
     if intermediate_tensors is not None:
-        torch._check(
+        torch._assert(
             input_ids.size()[0] == intermediate_tensors["hidden_states"].size()[0]
         )
 
     if inputs_embeds is not None:
-        torch._check(input_ids.size()[0] == inputs_embeds.size()[0])
+        torch._assert(input_ids.size()[0] == inputs_embeds.size()[0])
 
     if inputs_embeds is not None and intermediate_tensors is not None:
-        torch._check(
+        torch._assert(
             inputs_embeds.size()[1] == intermediate_tensors["hidden_states"].size()[1]
         )
 
@@ -566,7 +549,10 @@ class JetNemotronModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if residual is None:
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
