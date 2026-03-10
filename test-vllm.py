@@ -16,9 +16,9 @@ def main():
         gpu_memory_utilization=0.35,
     )
     
-    prompt = "Hello! Please introduce yourself."
+    prompt = "<|im_start|>user\nHello! Please introduce yourself.<|im_end|>\n<|im_start|>assistant\n"
     output = llm.generate([prompt])
-    print(output[0].outputs[0].text)
+    print("Generated Text:", output[0].outputs[0].text)
 
 if __name__ == "__main__":
     main()

@@ -36,6 +36,10 @@ from fla.ops.gated_delta_rule import (chunk_gated_delta_rule,
 from .dynamic_conv import DynamicShortConvolution
 from .configuration_jet_nemotron import JetNemotronConfig
 from .kv_cache import JetNemotronCache
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 
 
 @dataclass
@@ -109,11 +113,11 @@ class JetBlock(nn.Module):
             )
         assert self.mode in ['chunk', 'fused_recurrent'], f"Not suppoerted mode `{jet_block_config.mode}`."
 
-        self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.b_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
-        self.a_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
+        self.q_proj = ColumnParallelLinear(hidden_size, self.key_dim, bias=False)
+        self.k_proj = ColumnParallelLinear(hidden_size, self.key_dim, bias=False)
+        self.v_proj = ColumnParallelLinear(hidden_size, self.value_dim, bias=False)
+        self.b_proj = ColumnParallelLinear(hidden_size, self.num_heads, bias=False)
+        self.a_proj = ColumnParallelLinear(hidden_size, self.num_heads, bias=False)
 
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
@@ -143,19 +147,19 @@ class JetBlock(nn.Module):
             implementation=jet_block_config.dconv_implementation,
         )
 
-        self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
+        self.g_proj = ColumnParallelLinear(hidden_size, self.value_dim, bias=False)
         self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=float(jet_block_config.norm_eps), autotune_interval=self.autotune_interval)
-        self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+        self.o_proj = RowParallelLinear(self.value_dim, hidden_size, bias=False)
 
     def forward(
         self,
-        # positions: torch.Tensor,
+        *,
+        positions: Optional[torch.Tensor] = None,
         hidden_states: torch.Tensor,
-        past_key_value: Optional[JetNemotronCache] = None,
+        cache: Optional[JetNemotronCache] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = False,
         **kwargs
-    ) -> Tuple[torch.Tensor, None, Optional[JetNemotronCache]]:
+    )-> Tuple[torch.Tensor, None, Optional[JetNemotronCache]]:
         unsqueezed = False
         if hidden_states.dim() == 2:
             hidden_states = hidden_states.unsqueeze(0)
@@ -183,8 +187,8 @@ class JetBlock(nn.Module):
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
         last_state = None
-        if past_key_value is not None and len(past_key_value) > self.layer_idx:
-            last_state = past_key_value[self.layer_idx]
+        if cache is not None and len(cache) > self.layer_idx:
+            last_state = cache[self.layer_idx]
 
         cu_seqlens = kwargs.get('cu_seqlens', None)
         if attention_mask is not None and q_len > 1:
@@ -192,19 +196,29 @@ class JetBlock(nn.Module):
 
         conv_mask = attention_mask[:, -hidden_states.shape[1]:] if attention_mask is not None else None
 
-        q = F.silu(self.q_proj(hidden_states))
-        k = F.silu(self.k_proj(hidden_states))
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+
+        q = F.silu(q)
+        k = F.silu(k)
 
         conv_state = None
         if last_state is not None:
             conv_state = last_state['conv_state']
-        x = self.v_proj(hidden_states)
+        else:
+            if cache is not None:
+                conv_state = hidden_states.new_zeros(
+                    batch_size,
+                    self.value_dim,
+                    self.conv_size
+                )
+        x, _ = self.v_proj(hidden_states)
         v, conv_state = self.dynamic_conv1d(
             x=x,
             generator_input=hidden_states,
             mask=conv_mask,
             cache=conv_state,
-            output_final_state=use_cache,
+            output_final_state=(cache is not None),
         )
 
         if attention_mask is not None and q_len > 1:
@@ -215,9 +229,11 @@ class JetBlock(nn.Module):
         
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
-        beta = self.b_proj(hidden_states).sigmoid()
+        beta, _ = self.b_proj(hidden_states)
+        beta = beta.sigmoid()
 
-        g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
+        a, _ = self.a_proj(hidden_states)
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk' and not torch.compiler.is_compiling():
@@ -228,7 +244,7 @@ class JetBlock(nn.Module):
                 g=g,
                 beta=beta,
                 initial_state=recurrent_state,
-                output_final_state=use_cache,
+                output_final_state=(cache is not None),
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
                 autotune_interval=self.autotune_interval
@@ -241,28 +257,29 @@ class JetBlock(nn.Module):
                 g=g,
                 beta=beta,
                 initial_state=recurrent_state,
-                output_final_state=use_cache,
+                output_final_state=(cache is not None),
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True
             )
         # else:
         #     raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-        if past_key_value is not None:
-            past_key_value.update(
+        if cache is not None:
+            cache.update(
                 recurrent_state=recurrent_state,
                 conv_state=conv_state,
                 layer_idx=self.layer_idx,
                 offset=q_len
             )
 
-        g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
+        g_proj, _ = self.g_proj(hidden_states)
+        g = rearrange(g_proj, '... (h d) -> ... h d', d=self.head_v_dim)
         o = self.o_norm(o, g)
         o = rearrange(o, 'b t h d -> b t (h d)')
-        o = self.o_proj(o)
+        o, _ = self.o_proj(o)
         if attention_mask is not None and q_len > 1:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
         if unsqueezed:
             o = o.squeeze(0)
 
-        return o, None, past_key_value
+        return o, None, cache

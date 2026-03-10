@@ -197,9 +197,9 @@ class JetNemotronAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, cache)
         output, _ = self.o_proj(attn_output)
-        return output
+        return output, None, cache
 
 
 class DynamicShortConvolutionVLLM(nn.Module):
@@ -405,13 +405,16 @@ class JetNemotronDecoderLayer(nn.Module):
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
             
             # 应用动态卷积
-            hidden_states = self.dynamic_conv(hidden_states)
+            hidden_states, _, _ = self.dynamic_conv(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
             
             # MLP部分
             hidden_states, residual = self.post_conv_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
 
-        return hidden_states, None, residual
+        return hidden_states, residual, None
 
 
 def jet_nemotron_model_invariants(
@@ -662,7 +665,8 @@ class JetNemotronModel(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
-
+        print("loaded params:", len(loaded_params))
+        print("total params:", len(params_dict))
         return loaded_params
 
 
