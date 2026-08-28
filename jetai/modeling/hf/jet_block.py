@@ -69,7 +69,8 @@ class JetBlock(nn.Module):
         layer_idx: Optional[int] = None,
         hidden_size: Optional[int] = None,
         initializer_range: Optional[float] = None,
-        jet_block_config: Optional[JetBlockConfig] = None
+        jet_block_config: Optional[JetBlockConfig] = None,
+        prefix: str = "",
     ) -> JetBlock:
         super().__init__()
 
@@ -113,11 +114,21 @@ class JetBlock(nn.Module):
             )
         assert self.mode in ['chunk', 'fused_recurrent'], f"Not suppoerted mode `{jet_block_config.mode}`."
 
-        self.q_proj = ColumnParallelLinear(hidden_size, self.key_dim, bias=False)
-        self.k_proj = ColumnParallelLinear(hidden_size, self.key_dim, bias=False)
-        self.v_proj = ColumnParallelLinear(hidden_size, self.value_dim, bias=False)
-        self.b_proj = ColumnParallelLinear(hidden_size, self.num_heads, bias=False)
-        self.a_proj = ColumnParallelLinear(hidden_size, self.num_heads, bias=False)
+        self.q_proj = ColumnParallelLinear(
+            hidden_size, self.key_dim, bias=False, prefix=f"{prefix}.q_proj"
+        )
+        self.k_proj = ColumnParallelLinear(
+            hidden_size, self.key_dim, bias=False, prefix=f"{prefix}.k_proj"
+        )
+        self.v_proj = ColumnParallelLinear(
+            hidden_size, self.value_dim, bias=False, prefix=f"{prefix}.v_proj"
+        )
+        self.b_proj = ColumnParallelLinear(
+            hidden_size, self.num_heads, bias=False, prefix=f"{prefix}.b_proj"
+        )
+        self.a_proj = ColumnParallelLinear(
+            hidden_size, self.num_heads, bias=False, prefix=f"{prefix}.a_proj"
+        )
 
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
@@ -147,9 +158,13 @@ class JetBlock(nn.Module):
             implementation=jet_block_config.dconv_implementation,
         )
 
-        self.g_proj = ColumnParallelLinear(hidden_size, self.value_dim, bias=False)
+        self.g_proj = ColumnParallelLinear(
+            hidden_size, self.value_dim, bias=False, prefix=f"{prefix}.g_proj"
+        )
         self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=float(jet_block_config.norm_eps), autotune_interval=self.autotune_interval)
-        self.o_proj = RowParallelLinear(self.value_dim, hidden_size, bias=False)
+        self.o_proj = RowParallelLinear(
+            self.value_dim, hidden_size, bias=False, prefix=f"{prefix}.o_proj"
+        )
 
     def forward(
         self,
@@ -189,7 +204,6 @@ class JetBlock(nn.Module):
         last_state = None
         if cache is not None and len(cache) > self.layer_idx:
             last_state = cache[self.layer_idx]
-
         cu_seqlens = kwargs.get('cu_seqlens', None)
         if attention_mask is not None and q_len > 1:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])

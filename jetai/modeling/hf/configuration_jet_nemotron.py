@@ -19,11 +19,24 @@
 """Jet-Nemotron model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
+try:
+    from transformers.modeling_rope_utils import rope_config_validation
+except ImportError:  # Transformers versions where the method moved to the config mixin.
+    rope_config_validation = None
 from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)
+
+
+# Transformers 5 validates ``layer_types`` against its shared vocabulary.
+# Keep accepting the names used by older Jet-Nemotron checkpoints while
+# exposing their equivalent standard names to the base configuration class.
+_LAYER_TYPE_ALIASES = {
+    "jet": "linear_attention",
+    "attn": "full_attention",
+    "swa": "sliding_attention",
+}
 
 
 class JetNemotronConfig(PretrainedConfig):
@@ -168,16 +181,25 @@ class JetNemotronConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_dropout = attention_dropout
         if layer_types is None:
-            self.layer_types = ["attn"] * num_hidden_layers
+            layer_types = ["attn"] * num_hidden_layers
         elif isinstance(layer_types, str):
-            self.layer_types = eval(layer_types)
-        else:
-            self.layer_types = layer_types
+            # Checkpoint configs historically stored this as a Python-list
+            # string. Keep that backwards-compatible input format.
+            layer_types = eval(layer_types)
+        # Normalize legacy Jet-Nemotron names before PreTrainedConfig's strict
+        # validation runs. The model implementation accepts both spellings.
+        self.layer_types = [
+            _LAYER_TYPE_ALIASES.get(layer_type, layer_type)
+            for layer_type in layer_types
+        ]
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        rope_config_validation(self)
+        if hasattr(self, "validate_rope"):
+            self.validate_rope()
+        elif rope_config_validation is not None:
+            rope_config_validation(self)
 
         self.efficient_attention_config = efficient_attention_config
         

@@ -20,8 +20,14 @@ from typing import Any, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.layer import Attention
+try:
+    # vLLM versions before v1 exposed these under ``vllm.attention``.
+    from vllm.attention.backends.abstract import AttentionType
+    from vllm.attention.layer import Attention
+except ImportError:
+    # vLLM 0.8+ moved the implementation into model_executor/v1.
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -166,13 +172,26 @@ class JetNemotronAttention(nn.Module):
 
             rope_scaling = rope_parameters.get("rope_scaling", None)
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim, 
-            max_position=max_position,
-            base=base,
-            rope_scaling=rope_scaling,
-        )
+        try:
+            # Legacy vLLM accepted ``rotary_dim``, ``base`` and ``rope_scaling``.
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position,
+                base=base,
+                rope_scaling=rope_scaling,
+            )
+        except TypeError:
+            # vLLM 0.8+ takes the consolidated rope parameter dictionary.
+            rope_parameters = dict(rope_parameters or {})
+            rope_parameters.setdefault("rope_theta", base)
+            if rope_scaling:
+                rope_parameters.update(rope_scaling)
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                max_position=max_position,
+                rope_parameters=rope_parameters,
+            )
         
         self.attn = Attention(
             self.num_heads,
@@ -292,7 +311,7 @@ class JetNemotronDecoderLayer(nn.Module):
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, 'layer_types') else "attn"
         
         # 初始化注意力或动态卷积层
-        if self.layer_type == "attn":
+        if self.layer_type in ("attn", "full_attention"):
             self.self_attn = JetNemotronAttention(
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -307,7 +326,7 @@ class JetNemotronDecoderLayer(nn.Module):
             )
             self.dynamic_conv = None
 
-        elif self.layer_type == "swa":
+        elif self.layer_type in ("swa", "sliding_attention"):
             sliding_window = None
             if hasattr(config, "efficient_attention_config") and config.efficient_attention_config:
                 swa_cfg = config.efficient_attention_config.get("swa", {})
@@ -326,12 +345,16 @@ class JetNemotronDecoderLayer(nn.Module):
                 layer_idx=layer_idx,
             )
             self.dynamic_conv = None
-        elif self.layer_type == "jet":
+        elif self.layer_type in ("jet", "linear_attention"):
             from .jet_block import JetBlock
             self.self_attn = JetBlock(
                 config=config,
-                layer_type=self.layer_type,
+                # ``linear_attention`` is the Transformers-standard alias;
+                # JetBlock still selects its settings from the historical
+                # ``efficient_attention_config["jet"]`` entry.
+                layer_type="jet",
                 layer_idx=layer_idx,
+                prefix=f"{prefix}.self_attn",
             )
             self.dynamic_conv = None
         else:
@@ -368,7 +391,9 @@ class JetNemotronDecoderLayer(nn.Module):
         # 用于动态卷积的额外LayerNorm
         self.post_conv_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
-        ) if self.layer_type not in ["attn", "swa", "jet"] else None
+        ) if self.layer_type not in [
+            "attn", "full_attention", "swa", "sliding_attention", "jet", "linear_attention"
+        ] else None
 
     def forward(
         self,

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable, Mapping, MutableSequence
-from typing import (TYPE_CHECKING, ClassVar, Literal, Optional, Protocol,
+from typing import (Any, TYPE_CHECKING, ClassVar, Literal, Optional, Protocol,
                     Union, overload, runtime_checkable)
 
 import numpy as np
@@ -12,13 +12,26 @@ from transformers import PretrainedConfig
 from transformers.models.whisper.tokenization_whisper import LANGUAGES
 from typing_extensions import Self, TypeIs
 
-from vllm.config import ModelConfig, SpeechToTextConfig
+from vllm.config import ModelConfig
+try:
+    from vllm.config import SpeechToTextConfig
+except ImportError:
+    # SpeechToTextConfig was added after vLLM 0.8; this project does not
+    # implement transcription, but the shared protocol keeps the annotation.
+    SpeechToTextConfig = Any
 from vllm.inputs import TokensPrompt
-from vllm.inputs.data import PromptType
+try:
+    from vllm.inputs.data import PromptType
+except ImportError:
+    # vLLM 0.8+ exports PromptType from vllm.inputs directly.
+    from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
-from vllm.utils import supports_kw
+try:
+    from vllm.utils import supports_kw
+except ImportError:
+    from vllm.utils.func_utils import supports_kw
 
 from .interfaces_base import is_pooling_model
 
