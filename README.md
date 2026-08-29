@@ -142,6 +142,19 @@ or
 python3 jetai/inference/generate.py --model_name_or_path ${PATH_TO_YOUR_MODEL}
 ```
 
+### Debug diagnostics
+
+Jet model diagnostics are disabled by default. Enable them with the canonical
+`JET_DEBUG` environment variable when launching vLLM:
+
+```bash
+JET_DEBUG=1 python test-vllm.py --model /path/to/Jet-Nemotron-2B
+```
+
+The smoke-test script also provides `--debug`. For existing scripts,
+`JET-DEBUG=1` (via `env`) and `JET_DEBUG_TRACE=1` remain accepted aliases.
+Set `JET_DEBUG=0` to disable diagnostics explicitly.
+
 ## 4 Evaluation on Benchmarks
 Run evaluation for MMLU, MMLU-pro, BBH, Commonsense, Math, Code, Retrieval, and LongBench Tasks.
 ```bash

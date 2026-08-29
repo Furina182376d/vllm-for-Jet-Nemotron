@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -37,6 +36,7 @@ from fla.ops.gated_delta_rule import (chunk_gated_delta_rule,
 from .dynamic_conv import DynamicShortConvolution
 from .configuration_jet_nemotron import JetNemotronConfig
 from .kv_cache import JetNemotronCache
+from jetai.utils.debug import debug_print, is_debug_enabled
 
 
 @dataclass
@@ -234,18 +234,19 @@ class JetBlock(nn.Module):
 
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
-        debug_block = os.environ.get("JET_DEBUG_TRACE") and self.layer_idx == 0 and q_len > 2
-        if debug_block:
-            print(
-                f"JET_DEBUG block0 q_proj_norm={q.float().norm().item():.6f} "
+        debug_block = is_debug_enabled() and self.layer_idx == 0 and q_len > 2
+        debug_print(
+            lambda: (
+                f"block0 q_proj_norm={q.float().norm().item():.6f} "
                 f"k_proj_norm={k.float().norm().item():.6f} "
                 f"input_norm={hidden_states.float().norm().item():.6f} "
                 f"q_weight_norm={self.q_proj.weight.float().norm().item():.6f} "
                 f"q_weight_sum={self.q_proj.weight.float().sum().item():.6f} "
                 f"q_weight_head={self.q_proj.weight.float().flatten()[:4].tolist()} "
-                f"v_weight_norm={self.v_proj.weight.float().norm().item():.6f}",
-                flush=True,
-            )
+                f"v_weight_norm={self.v_proj.weight.float().norm().item():.6f}"
+            ),
+            condition=debug_block,
+        )
 
 
         q = F.silu(q)
@@ -262,8 +263,10 @@ class JetBlock(nn.Module):
                     self.conv_size
                 )
         x = self.v_proj(hidden_states)
-        if debug_block:
-            print(f"JET_DEBUG block0 v_proj_norm={x.float().norm().item():.6f}", flush=True)
+        debug_print(
+            lambda: f"block0 v_proj_norm={x.float().norm().item():.6f}",
+            condition=debug_block,
+        )
         v, conv_state = self.dynamic_conv1d(
             x=x,
             generator_input=hidden_states,
@@ -272,13 +275,14 @@ class JetBlock(nn.Module):
             output_final_state=True,
         )
 
-        if debug_block:
-            print(
-                f"JET_DEBUG block0 q_silu_norm={q.float().norm().item():.6f} "
+        debug_print(
+            lambda: (
+                f"block0 q_silu_norm={q.float().norm().item():.6f} "
                 f"k_silu_norm={k.float().norm().item():.6f} "
-                f"v_conv_norm={v.float().norm().item():.6f}",
-                flush=True,
-            )
+                f"v_conv_norm={v.float().norm().item():.6f}"
+            ),
+            condition=debug_block,
+        )
 
         if attention_mask is not None and q_len > 1:
             q = index_first_axis(rearrange(q, "b s ... -> (b s) ..."), indices).unsqueeze(0)
@@ -342,8 +346,10 @@ class JetBlock(nn.Module):
         o = self.o_norm(o, g)
         o = rearrange(o, 'b t h d -> b t (h d)')
         o = self.o_proj(o)
-        if debug_block:
-            print(f"JET_DEBUG block0 output_norm={o.float().norm().item():.6f}", flush=True)
+        debug_print(
+            lambda: f"block0 output_norm={o.float().norm().item():.6f}",
+            condition=debug_block,
+        )
         if attention_mask is not None and q_len > 1:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
         if unsqueezed:

@@ -15,6 +15,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import inspect
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -60,8 +61,7 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-import inspect
-import os
+from jetai.utils.debug import debug_print, is_debug_enabled
 
 _SUPPORTS_SHAPE_INVARIANTS = (
     "shape_invariants" in inspect.signature(support_torch_compile).parameters
@@ -441,16 +441,17 @@ class JetNemotronDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        debug_layer = os.environ.get("JET_DEBUG_TRACE") and hidden_states.shape[0] > 2
-        if debug_layer:
-            print(
-                f"JET_DEBUG layer={self.layer_idx} norm_weight_norm="
+        debug_layer = is_debug_enabled() and hidden_states.shape[0] > 2
+        debug_print(
+            lambda: (
+                f"layer={self.layer_idx} norm_weight_norm="
                 f"{self.input_layernorm.weight.float().norm().item():.6f} "
                 f"normed_input_norm={hidden_states.float().norm().item():.6f} "
                 f"shape={tuple(hidden_states.shape)} "
-                f"row_norms={hidden_states.float().reshape(-1, hidden_states.shape[-1]).norm(dim=-1)[:16].tolist()}",
-                flush=True,
-            )
+                f"row_norms={hidden_states.float().reshape(-1, hidden_states.shape[-1]).norm(dim=-1)[:16].tolist()}"
+            ),
+            condition=debug_layer,
+        )
 
         if self.self_attn is not None:
             out = self.self_attn(
@@ -463,11 +464,10 @@ class JetNemotronDecoderLayer(nn.Module):
             else:
                 hidden_states = out
 
-            if debug_layer:
-                print(
-                    f"JET_DEBUG layer={self.layer_idx} attn_norm={hidden_states.float().norm().item():.6f}",
-                    flush=True,
-                )
+            debug_print(
+                lambda: f"layer={self.layer_idx} attn_norm={hidden_states.float().norm().item():.6f}",
+                condition=debug_layer,
+            )
 
             # MLP部分
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -490,12 +490,13 @@ class JetNemotronDecoderLayer(nn.Module):
             hidden_states, residual = self.post_conv_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
 
-        if os.environ.get("JET_DEBUG_TRACE") and hidden_states.shape[0] > 2:
-            print(
-                f"JET_DEBUG layer={self.layer_idx} mlp_norm={hidden_states.float().norm().item():.6f} "
-                f"total_norm={(hidden_states + residual).float().norm().item():.6f}",
-                flush=True,
-            )
+        debug_print(
+            lambda: (
+                f"layer={self.layer_idx} mlp_norm={hidden_states.float().norm().item():.6f} "
+                f"total_norm={(hidden_states + residual).float().norm().item():.6f}"
+            ),
+            condition=debug_layer,
+        )
 
         return hidden_states, residual, None
 
@@ -612,16 +613,20 @@ class JetNemotronModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
-            if os.environ.get("JET_DEBUG_TRACE") and input_ids is not None and input_ids.numel() <= 32:
-                embed_info = (
-                    "none"
-                    if inputs_embeds is None
-                    else f"shape={tuple(inputs_embeds.shape)} norm={inputs_embeds.float().norm().item():.6f}"
-                )
-                print(
-                    f"JET_DEBUG input_ids={input_ids.reshape(-1).tolist()} inputs_embeds={embed_info}",
-                    flush=True,
-                )
+            debug_print(
+                lambda: (
+                    f"input_ids={input_ids.reshape(-1).tolist()} inputs_embeds="
+                    + (
+                        "none"
+                        if inputs_embeds is None
+                        else "shape={} norm={:.6f}".format(
+                            tuple(inputs_embeds.shape),
+                            inputs_embeds.float().norm().item(),
+                        )
+                    )
+                ),
+                condition=input_ids is not None and input_ids.numel() <= 32,
+            )
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -633,12 +638,11 @@ class JetNemotronModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
-        debug_layers = os.environ.get("JET_DEBUG_TRACE") and hidden_states.shape[0] > 2
-        if debug_layers:
-            print(
-                f"JET_DEBUG embedding_norm={hidden_states.float().norm().item():.6f}",
-                flush=True,
-            )
+        debug_layers = is_debug_enabled() and hidden_states.shape[0] > 2
+        debug_print(
+            lambda: f"embedding_norm={hidden_states.float().norm().item():.6f}",
+            condition=debug_layers,
+        )
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
@@ -647,10 +651,8 @@ class JetNemotronModel(nn.Module):
             hidden_states, residual, _ = layer(positions, hidden_states, residual)
             if debug_layers:
                 total = hidden_states + residual if residual is not None else hidden_states
-                print(
-                    f"JET_DEBUG layer={self.start_layer + idx} "
-                    f"total_norm={total.float().norm().item():.6f}",
-                    flush=True,
+                debug_print(
+                    lambda: f"layer={self.start_layer + idx} total_norm={total.float().norm().item():.6f}",
                 )
 
         if not get_pp_group().is_last_rank:
@@ -663,8 +665,10 @@ class JetNemotronModel(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        if debug_layers:
-            print(f"JET_DEBUG final_norm={hidden_states.float().norm().item():.6f}", flush=True)
+        debug_print(
+            lambda: f"final_norm={hidden_states.float().norm().item():.6f}",
+            condition=debug_layers,
+        )
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -783,8 +787,7 @@ class JetNemotronModel(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
-        print("loaded params:", len(loaded_params))
-        print("total params:", len(params_dict))
+        debug_print(lambda: f"loaded_params={len(loaded_params)} total_params={len(params_dict)}")
         return loaded_params
 
 

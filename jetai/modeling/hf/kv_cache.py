@@ -21,6 +21,8 @@ from typing import Any, Optional
 import torch
 import transformers
 
+from jetai.utils.debug import debug_print
+
 __all__ = ["JetCache"]
 
 
@@ -199,8 +201,12 @@ class JetNemotronCache(transformers.cache_utils.Cache):
                 # compute state size in MB
                 key_size = key_state.element_size() * key_state.nelement() / (1024**2)
                 value_size = value_state.element_size() * value_state.nelement() / (1024**2)
-                print(key_state.shape, value_state.shape)
-                print(f"Layer {layer_idx}: Attention. cache size: {key_size + value_size:.2f} MB")
+                debug_print(
+                    lambda: (
+                        f"cache layer={layer_idx} attention_shapes=({key_state.shape}, {value_state.shape}) "
+                        f"size={key_size + value_size:.2f} MB"
+                    )
+                )
             if state.get("conv_state", None) is not None:
                 conv_state = state["conv_state"]
                 # compute state size in MB
@@ -209,14 +215,14 @@ class JetNemotronCache(transformers.cache_utils.Cache):
                     conv_size = conv.element_size() * conv.nelement() / (1024**2)
                     conv_sizes.append(conv_size)
                 conv_size = sum(conv_sizes)
-                print(f"Layer {layer_idx}: Convolution. cache size: {conv_size:.2f} MB")
+                debug_print(lambda: f"cache layer={layer_idx} convolution_size={conv_size:.2f} MB")
             if state.get("ffn_state", None) is not None:
                 ffn_state = state["ffn_state"]
                 # compute state size in MB
                 ffn_size = ffn_state.element_size() * ffn_state.nelement() / (1024**2)
-                print(f"Layer {layer_idx}: FFN. cache size: {ffn_size:.2f} MB")
+                debug_print(lambda: f"cache layer={layer_idx} ffn_size={ffn_size:.2f} MB")
             if state.get("recurrent_state", None) is not None:
                 recurrent_state = state["recurrent_state"]
                 # compute state size in MB
                 recurrent_size = recurrent_state.element_size() * recurrent_state.nelement() / (1024**2)
-                print(f"Layer {layer_idx}: Recurrent. cache size: {recurrent_size:.2f} MB")
+                debug_print(lambda: f"cache layer={layer_idx} recurrent_size={recurrent_size:.2f} MB")

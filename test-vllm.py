@@ -72,11 +72,20 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Number of timed generations to average (default: 1).",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable Jet model diagnostics (equivalent to JET_DEBUG=1).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = _parse_args()
+    if args.debug:
+        from jetai.utils.debug import set_debug
+
+        set_debug()
     model_path = args.model
     tokenizer_path = args.tokenizer or model_path
 
