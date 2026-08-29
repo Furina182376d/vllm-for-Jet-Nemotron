@@ -441,7 +441,7 @@ class JetNemotronDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        debug_layer = os.environ.get("JET_DEBUG") and hidden_states.shape[0] > 2
+        debug_layer = os.environ.get("JET_DEBUG_TRACE") and hidden_states.shape[0] > 2
         if debug_layer:
             print(
                 f"JET_DEBUG layer={self.layer_idx} norm_weight_norm="
@@ -490,7 +490,7 @@ class JetNemotronDecoderLayer(nn.Module):
             hidden_states, residual = self.post_conv_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
 
-        if os.environ.get("JET_DEBUG") and hidden_states.shape[0] > 2:
+        if os.environ.get("JET_DEBUG_TRACE") and hidden_states.shape[0] > 2:
             print(
                 f"JET_DEBUG layer={self.layer_idx} mlp_norm={hidden_states.float().norm().item():.6f} "
                 f"total_norm={(hidden_states + residual).float().norm().item():.6f}",
@@ -612,7 +612,7 @@ class JetNemotronModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
-            if os.environ.get("JET_DEBUG") and input_ids is not None and input_ids.numel() <= 32:
+            if os.environ.get("JET_DEBUG_TRACE") and input_ids is not None and input_ids.numel() <= 32:
                 embed_info = (
                     "none"
                     if inputs_embeds is None
@@ -633,7 +633,7 @@ class JetNemotronModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
-        debug_layers = os.environ.get("JET_DEBUG") and hidden_states.shape[0] > 2
+        debug_layers = os.environ.get("JET_DEBUG_TRACE") and hidden_states.shape[0] > 2
         if debug_layers:
             print(
                 f"JET_DEBUG embedding_norm={hidden_states.float().norm().item():.6f}",

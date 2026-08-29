@@ -234,7 +234,7 @@ class JetBlock(nn.Module):
 
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
-        debug_block = os.environ.get("JET_DEBUG") and self.layer_idx == 0 and q_len > 2
+        debug_block = os.environ.get("JET_DEBUG_TRACE") and self.layer_idx == 0 and q_len > 2
         if debug_block:
             print(
                 f"JET_DEBUG block0 q_proj_norm={q.float().norm().item():.6f} "

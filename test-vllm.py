@@ -50,20 +50,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature for the smoke test (default: 0.7).",
+        default=0.0,
+        help="Sampling temperature for the smoke test (default: greedy decoding).",
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=64,
-        help="Maximum number of generated tokens (use 1 to inspect the first token).",
-    )
-    parser.add_argument(
-        "--logprobs",
-        type=int,
-        default=20,
-        help="Number of vLLM top log-probabilities to return (default: 20).",
+        default=32,
+        help="Maximum number of generated tokens (default: 32).",
     )
     return parser.parse_args()
 
@@ -106,26 +100,29 @@ def main():
         tokenizer=tokenizer_path,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=not args.compile,
+        # JetBlock keeps per-layer recurrent/ convolution state between decode
+        # steps; synchronous scheduling preserves that state ordering.
+        async_scheduling=False,
     )
     
-    prompt = "<|im_start|>user\nHello! Please introduce yourself.<|im_end|>\n<|im_start|>assistant\n"
+    prompt = (
+        "<|im_start|>user\n"
+        "Introduce yourself in one concise sentence.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
     output = llm.generate(
         [prompt],
         sampling_params=SamplingParams(
             temperature=args.temperature,
             max_tokens=args.max_tokens,
-            logprobs=args.logprobs,
+            # Stop at chat-role boundaries as well as the native turn marker.
+            # Some checkpoints emit the next role as plain text without first
+            # producing <|im_end|>.
+            stop_token_ids=[151645],
+            stop=["\nuser", "\nassistant", "<|im_end|>", "<|im_start|>"],
         ),
     )
-    completion = output[0].outputs[0]
-    print("Prompt Token IDs:", output[0].prompt_token_ids)
-    print("Generated Token IDs:", completion.token_ids)
-    print("Generated Text:", completion.text)
-    if completion.logprobs:
-        print("vLLM next-token logprobs:")
-        for token_id, logprob in completion.logprobs[0].items():
-            print(f"  id={token_id:6d} logprob={logprob.logprob: .6f} token={logprob.decoded_token!r}")
-    print("Generated Text:", output[0].outputs[0].text)
+    print(output[0].outputs[0].text)
 
 if __name__ == "__main__":
     main()
