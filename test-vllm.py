@@ -53,6 +53,18 @@ def _parse_args() -> argparse.Namespace:
         default=0.7,
         help="Sampling temperature for the smoke test (default: 0.7).",
     )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=64,
+        help="Maximum number of generated tokens (use 1 to inspect the first token).",
+    )
+    parser.add_argument(
+        "--logprobs",
+        type=int,
+        default=20,
+        help="Number of vLLM top log-probabilities to return (default: 20).",
+    )
     return parser.parse_args()
 
 
@@ -60,6 +72,12 @@ def main():
     args = _parse_args()
     model_path = args.model
     tokenizer_path = args.tokenizer or model_path
+
+    # JetNemotron currently uses the V1 runner's input/state path.  The V2
+    # runner's Triton/UVA prefill buffer can leave custom-model prompt IDs at
+    # their zero-initialized values (token 0), which changes the model input.
+    # Keep an explicit environment override for users testing V2 support.
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
     # vLLM otherwise starts an EngineCore process before reporting this common
     # setup error, which obscures the actual fix in a long traceback.
@@ -95,9 +113,18 @@ def main():
         [prompt],
         sampling_params=SamplingParams(
             temperature=args.temperature,
-            max_tokens=64,
+            max_tokens=args.max_tokens,
+            logprobs=args.logprobs,
         ),
     )
+    completion = output[0].outputs[0]
+    print("Prompt Token IDs:", output[0].prompt_token_ids)
+    print("Generated Token IDs:", completion.token_ids)
+    print("Generated Text:", completion.text)
+    if completion.logprobs:
+        print("vLLM next-token logprobs:")
+        for token_id, logprob in completion.logprobs[0].items():
+            print(f"  id={token_id:6d} logprob={logprob.logprob: .6f} token={logprob.decoded_token!r}")
     print("Generated Text:", output[0].outputs[0].text)
 
 if __name__ == "__main__":

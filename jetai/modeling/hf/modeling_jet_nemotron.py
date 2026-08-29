@@ -31,10 +31,7 @@ except ImportError:
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -64,7 +61,7 @@ from .utils import (
     maybe_prefix,
 )
 import inspect
-from vllm.compilation.decorators import support_torch_compile
+import os
 
 _SUPPORTS_SHAPE_INVARIANTS = (
     "shape_invariants" in inspect.signature(support_torch_compile).parameters
@@ -80,31 +77,46 @@ class JetNemotronMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-        )
+        # Keep the HF parameter layout (separate gate/up matrices).  The
+        # checkpoint is not stored in packed gate/up order, and using a
+        # packed tensor-parallel layer here can silently alter that mapping
+        # even for a single-rank engine.
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = nn.SiLU()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class JetNemotronRMSNorm(nn.Module):
+    """HF-compatible RMSNorm with the residual-carrying vLLM interface."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def _norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * hidden_states).to(input_dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ):
+        if residual is None:
+            return self._norm(hidden_states)
+        residual = residual + hidden_states
+        return self._norm(residual), residual
 
 
 class JetNemotronAttention(nn.Module):
@@ -161,16 +173,19 @@ class JetNemotronAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        base = 10000
-        rope_scaling = None
-
-        if rope_parameters:
-            if "theta" in rope_parameters:
-                base = rope_parameters["theta"]
-            elif "rope_theta" in rope_parameters:
-                base = rope_parameters["rope_theta"]
-
-            rope_scaling = rope_parameters.get("rope_scaling", None)
+        # Older Transformers configs expose ``rope_theta``/``rope_scaling``
+        # directly, while newer ones consolidate them in ``rope_parameters``.
+        # Resolve both forms explicitly so vLLM never silently falls back to
+        # the default theta (10000).
+        rope_parameters = dict(rope_parameters or {})
+        base = rope_parameters.get(
+            "rope_theta",
+            rope_parameters.get(
+                "theta",
+                10000.0,
+            ),
+        )
+        rope_scaling = rope_parameters.get("rope_scaling", None)
 
         try:
             # Legacy vLLM accepted ``rotary_dim``, ``base`` and ``rope_scaling``.
@@ -185,6 +200,7 @@ class JetNemotronAttention(nn.Module):
             # vLLM 0.8+ takes the consolidated rope parameter dictionary.
             rope_parameters = dict(rope_parameters or {})
             rope_parameters.setdefault("rope_theta", base)
+            rope_parameters.setdefault("rope_type", "default")
             if rope_scaling:
                 rope_parameters.update(rope_scaling)
             self.rotary_emb = get_rope(
@@ -204,6 +220,9 @@ class JetNemotronAttention(nn.Module):
             prefix=f"{prefix}.attn",
             per_layer_sliding_window=sliding_window,
         )
+        self._attn_accepts_output_shape = (
+            "output_shape" in inspect.signature(self.attn.forward).parameters
+        )
 
     def forward(
         self,
@@ -216,7 +235,16 @@ class JetNemotronAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, cache)
+        # vLLM v1 keeps the KV cache in the attention module's forward
+        # context; the legacy fourth positional argument is ``output_shape``
+        # in this API and must not receive a model cache object.
+        # vLLM 0.27+ obtains the KV cache from forward context and accepts an
+        # optional output shape. Older releases used the fourth positional
+        # argument for a cache object, so keep a signature-based fallback.
+        if self._attn_accepts_output_shape:
+            attn_output = self.attn(q, k, v, output_shape=hidden_states.shape)
+        else:
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output, None, cache
 
@@ -317,7 +345,10 @@ class JetNemotronDecoderLayer(nn.Module):
                 num_heads=config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
                 max_position=config.max_position_embeddings,
-                rope_parameters=getattr(config, "rope_parameters", {}),
+                rope_parameters=(
+                    getattr(config, "rope_parameters", None)
+                    or {"rope_theta": getattr(config, "rope_theta", 10000.0)}
+                ),
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
@@ -337,7 +368,10 @@ class JetNemotronDecoderLayer(nn.Module):
                 num_heads=config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
                 max_position=config.max_position_embeddings,
-                rope_parameters=getattr(config, "rope_parameters", {}),
+                rope_parameters=(
+                    getattr(config, "rope_parameters", None)
+                    or {"rope_theta": getattr(config, "rope_theta", 10000.0)}
+                ),
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
@@ -383,13 +417,13 @@ class JetNemotronDecoderLayer(nn.Module):
         )
         
         # LayerNorm层
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = JetNemotronRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         
         # 用于动态卷积的额外LayerNorm
-        self.post_conv_layernorm = RMSNorm(
+        self.post_conv_layernorm = JetNemotronRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         ) if self.layer_type not in [
             "attn", "full_attention", "swa", "sliding_attention", "jet", "linear_attention"
@@ -407,6 +441,17 @@ class JetNemotronDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        debug_layer = os.environ.get("JET_DEBUG") and hidden_states.shape[0] > 2
+        if debug_layer:
+            print(
+                f"JET_DEBUG layer={self.layer_idx} norm_weight_norm="
+                f"{self.input_layernorm.weight.float().norm().item():.6f} "
+                f"normed_input_norm={hidden_states.float().norm().item():.6f} "
+                f"shape={tuple(hidden_states.shape)} "
+                f"row_norms={hidden_states.float().reshape(-1, hidden_states.shape[-1]).norm(dim=-1)[:16].tolist()}",
+                flush=True,
+            )
+
         if self.self_attn is not None:
             out = self.self_attn(
                 positions=positions,
@@ -417,6 +462,12 @@ class JetNemotronDecoderLayer(nn.Module):
                 hidden_states, _, _ = out
             else:
                 hidden_states = out
+
+            if debug_layer:
+                print(
+                    f"JET_DEBUG layer={self.layer_idx} attn_norm={hidden_states.float().norm().item():.6f}",
+                    flush=True,
+                )
 
             # MLP部分
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -438,6 +489,13 @@ class JetNemotronDecoderLayer(nn.Module):
             # MLP部分
             hidden_states, residual = self.post_conv_layernorm(hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
+
+        if os.environ.get("JET_DEBUG") and hidden_states.shape[0] > 2:
+            print(
+                f"JET_DEBUG layer={self.layer_idx} mlp_norm={hidden_states.float().norm().item():.6f} "
+                f"total_norm={(hidden_states + residual).float().norm().item():.6f}",
+                flush=True,
+            )
 
         return hidden_states, residual, None
 
@@ -537,7 +595,7 @@ class JetNemotronModel(nn.Module):
         )
         
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = JetNemotronRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -554,6 +612,16 @@ class JetNemotronModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
+            if os.environ.get("JET_DEBUG") and input_ids is not None and input_ids.numel() <= 32:
+                embed_info = (
+                    "none"
+                    if inputs_embeds is None
+                    else f"shape={tuple(inputs_embeds.shape)} norm={inputs_embeds.float().norm().item():.6f}"
+                )
+                print(
+                    f"JET_DEBUG input_ids={input_ids.reshape(-1).tolist()} inputs_embeds={embed_info}",
+                    flush=True,
+                )
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -565,12 +633,25 @@ class JetNemotronModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
+        debug_layers = os.environ.get("JET_DEBUG") and hidden_states.shape[0] > 2
+        if debug_layers:
+            print(
+                f"JET_DEBUG embedding_norm={hidden_states.float().norm().item():.6f}",
+                flush=True,
+            )
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
             hidden_states, residual, _ = layer(positions, hidden_states, residual)
+            if debug_layers:
+                total = hidden_states + residual if residual is not None else hidden_states
+                print(
+                    f"JET_DEBUG layer={self.start_layer + idx} "
+                    f"total_norm={total.float().norm().item():.6f}",
+                    flush=True,
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -581,6 +662,9 @@ class JetNemotronModel(nn.Module):
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
+
+        if debug_layers:
+            print(f"JET_DEBUG final_norm={hidden_states.float().norm().item():.6f}", flush=True)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -639,6 +723,15 @@ class JetNemotronModel(nn.Module):
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
+                continue
+
+            # Plain HF-layout parameters (including the MLP and JetBlock)
+            # should be loaded verbatim before considering packed mappings.
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
                 continue
 
             # ===== qkv / gate_up 堆叠参数 =====

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -36,10 +37,6 @@ from fla.ops.gated_delta_rule import (chunk_gated_delta_rule,
 from .dynamic_conv import DynamicShortConvolution
 from .configuration_jet_nemotron import JetNemotronConfig
 from .kv_cache import JetNemotronCache
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
 
 
 @dataclass
@@ -99,6 +96,14 @@ class JetBlock(nn.Module):
         self.head_v_dim = int(jet_block_config.head_dim * self.expand_v)
         self.layer_idx = layer_idx
 
+        # vLLM's generic model interface does not pass a HF-style cache to
+        # custom attention-free layers. Keep the latest state locally so
+        # single-token decode steps remain autoregressive. A new prefill
+        # (q_len > 1) resets these values below.
+        self._cached_conv_state: Optional[torch.Tensor] = None
+        self._cached_recurrent_state: Optional[torch.Tensor] = None
+        self._cached_position: Optional[int] = None
+
         self.autotune_interval = 32 * 16 * 1024 # 32 batch size * 16 num head * 1024 sequence length
 
         # Consistency check: Ensure expand_v produces integer values
@@ -114,21 +119,15 @@ class JetBlock(nn.Module):
             )
         assert self.mode in ['chunk', 'fused_recurrent'], f"Not suppoerted mode `{jet_block_config.mode}`."
 
-        self.q_proj = ColumnParallelLinear(
-            hidden_size, self.key_dim, bias=False, prefix=f"{prefix}.q_proj"
-        )
-        self.k_proj = ColumnParallelLinear(
-            hidden_size, self.key_dim, bias=False, prefix=f"{prefix}.k_proj"
-        )
-        self.v_proj = ColumnParallelLinear(
-            hidden_size, self.value_dim, bias=False, prefix=f"{prefix}.v_proj"
-        )
-        self.b_proj = ColumnParallelLinear(
-            hidden_size, self.num_heads, bias=False, prefix=f"{prefix}.b_proj"
-        )
-        self.a_proj = ColumnParallelLinear(
-            hidden_size, self.num_heads, bias=False, prefix=f"{prefix}.a_proj"
-        )
+        # Keep these projections as regular Linear layers.  Jet checkpoints
+        # store each matrix independently in Hugging Face layout; using
+        # vLLM's tensor-parallel wrappers here can apply an extra shard
+        # transform during loading even when TP=1.
+        self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
+        self.b_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
+        self.a_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
 
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
@@ -158,13 +157,9 @@ class JetBlock(nn.Module):
             implementation=jet_block_config.dconv_implementation,
         )
 
-        self.g_proj = ColumnParallelLinear(
-            hidden_size, self.value_dim, bias=False, prefix=f"{prefix}.g_proj"
-        )
+        self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
         self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=float(jet_block_config.norm_eps), autotune_interval=self.autotune_interval)
-        self.o_proj = RowParallelLinear(
-            self.value_dim, hidden_size, bias=False, prefix=f"{prefix}.o_proj"
-        )
+        self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
     def forward(
         self,
@@ -196,7 +191,15 @@ class JetBlock(nn.Module):
             )
 
         batch_size, q_len, _ = hidden_states.shape
-        # change to inference mode.
+        position_end: Optional[int] = None
+        if positions is not None and positions.numel() > 0:
+            # vLLM supplies absolute positions for flattened prompt/decode
+            # tokens.  Keep a Python scalar so stale state is never reused
+            # for a new request that happens to use the same module instance.
+            position_end = int(positions.reshape(-1)[-1].item())
+        # Match the Hugging Face implementation: short prompts and decode
+        # steps use the recurrent kernel, while long prefills use chunking.
+        # This distinction is numerically important for the checkpoint.
         mode = 'fused_recurrent' if q_len <= 64 else self.mode
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
@@ -204,14 +207,46 @@ class JetBlock(nn.Module):
         last_state = None
         if cache is not None and len(cache) > self.layer_idx:
             last_state = cache[self.layer_idx]
+        elif (
+            q_len == 1
+            and self._cached_recurrent_state is not None
+            and (
+                position_end is None
+                or self._cached_position is None
+                or position_end == self._cached_position + 1
+            )
+        ):
+            last_state = {
+                "conv_state": self._cached_conv_state,
+                "recurrent_state": self._cached_recurrent_state,
+            }
+        elif q_len > 1 or self._cached_recurrent_state is not None:
+            # A multi-token call, or a non-contiguous single token, starts a
+            # new sequence in the generic vLLM interface.
+            self._cached_conv_state = None
+            self._cached_recurrent_state = None
+            self._cached_position = None
         cu_seqlens = kwargs.get('cu_seqlens', None)
         if attention_mask is not None and q_len > 1:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
 
         conv_mask = attention_mask[:, -hidden_states.shape[1]:] if attention_mask is not None else None
 
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        debug_block = os.environ.get("JET_DEBUG") and self.layer_idx == 0 and q_len > 2
+        if debug_block:
+            print(
+                f"JET_DEBUG block0 q_proj_norm={q.float().norm().item():.6f} "
+                f"k_proj_norm={k.float().norm().item():.6f} "
+                f"input_norm={hidden_states.float().norm().item():.6f} "
+                f"q_weight_norm={self.q_proj.weight.float().norm().item():.6f} "
+                f"q_weight_sum={self.q_proj.weight.float().sum().item():.6f} "
+                f"q_weight_head={self.q_proj.weight.float().flatten()[:4].tolist()} "
+                f"v_weight_norm={self.v_proj.weight.float().norm().item():.6f}",
+                flush=True,
+            )
+
 
         q = F.silu(q)
         k = F.silu(k)
@@ -226,14 +261,24 @@ class JetBlock(nn.Module):
                     self.value_dim,
                     self.conv_size
                 )
-        x, _ = self.v_proj(hidden_states)
+        x = self.v_proj(hidden_states)
+        if debug_block:
+            print(f"JET_DEBUG block0 v_proj_norm={x.float().norm().item():.6f}", flush=True)
         v, conv_state = self.dynamic_conv1d(
             x=x,
             generator_input=hidden_states,
             mask=conv_mask,
             cache=conv_state,
-            output_final_state=(cache is not None),
+            output_final_state=True,
         )
+
+        if debug_block:
+            print(
+                f"JET_DEBUG block0 q_silu_norm={q.float().norm().item():.6f} "
+                f"k_silu_norm={k.float().norm().item():.6f} "
+                f"v_conv_norm={v.float().norm().item():.6f}",
+                flush=True,
+            )
 
         if attention_mask is not None and q_len > 1:
             q = index_first_axis(rearrange(q, "b s ... -> (b s) ..."), indices).unsqueeze(0)
@@ -243,10 +288,10 @@ class JetBlock(nn.Module):
         
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
-        beta, _ = self.b_proj(hidden_states)
+        beta = self.b_proj(hidden_states)
         beta = beta.sigmoid()
 
-        a, _ = self.a_proj(hidden_states)
+        a = self.a_proj(hidden_states)
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
@@ -258,7 +303,7 @@ class JetBlock(nn.Module):
                 g=g,
                 beta=beta,
                 initial_state=recurrent_state,
-                output_final_state=(cache is not None),
+                output_final_state=True,
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
                 autotune_interval=self.autotune_interval
@@ -271,7 +316,7 @@ class JetBlock(nn.Module):
                 g=g,
                 beta=beta,
                 initial_state=recurrent_state,
-                output_final_state=(cache is not None),
+                output_final_state=True,
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True
             )
@@ -285,12 +330,20 @@ class JetBlock(nn.Module):
                 layer_idx=self.layer_idx,
                 offset=q_len
             )
+        elif recurrent_state is not None:
+            self._cached_recurrent_state = recurrent_state.detach()
+            self._cached_conv_state = (
+                conv_state.detach() if conv_state is not None else None
+            )
+            self._cached_position = position_end
 
-        g_proj, _ = self.g_proj(hidden_states)
+        g_proj = self.g_proj(hidden_states)
         g = rearrange(g_proj, '... (h d) -> ... h d', d=self.head_v_dim)
         o = self.o_norm(o, g)
         o = rearrange(o, 'b t h d -> b t (h d)')
-        o, _ = self.o_proj(o)
+        o = self.o_proj(o)
+        if debug_block:
+            print(f"JET_DEBUG block0 output_norm={o.float().norm().item():.6f}", flush=True)
         if attention_mask is not None and q_len > 1:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
         if unsqueezed:
