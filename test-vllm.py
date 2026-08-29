@@ -1,5 +1,6 @@
 import os
 import argparse
+import time
 from pathlib import Path
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
@@ -59,6 +60,18 @@ def _parse_args() -> argparse.Namespace:
         default=32,
         help="Maximum number of generated tokens (default: 32).",
     )
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=1,
+        help="Untimed warmup generations before measurement (default: 1).",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of timed generations to average (default: 1).",
+    )
     return parser.parse_args()
 
 
@@ -110,19 +123,41 @@ def main():
         "Introduce yourself in one concise sentence.<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
-    output = llm.generate(
-        [prompt],
-        sampling_params=SamplingParams(
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            # Stop at chat-role boundaries as well as the native turn marker.
-            # Some checkpoints emit the next role as plain text without first
-            # producing <|im_end|>.
-            stop_token_ids=[151645],
-            stop=["\nuser", "\nassistant", "<|im_end|>", "<|im_start|>"],
-        ),
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        # Stop at chat-role boundaries as well as the native turn marker.
+        # Some checkpoints emit the next role as plain text without first
+        # producing <|im_end|>.
+        stop_token_ids=[151645],
+        stop=["\nuser", "\nassistant", "<|im_end|>", "<|im_start|>"],
     )
-    print(output[0].outputs[0].text)
+
+    for _ in range(max(args.warmup_runs, 0)):
+        llm.generate([prompt], sampling_params=sampling_params)
+
+    timings = []
+    outputs = []
+    for _ in range(max(args.runs, 1)):
+        start = time.perf_counter()
+        result = llm.generate([prompt], sampling_params=sampling_params)[0]
+        elapsed = time.perf_counter() - start
+        completion = result.outputs[0]
+        timings.append((elapsed, len(result.prompt_token_ids), len(completion.token_ids)))
+        outputs.append(completion.text)
+
+    elapsed = sum(item[0] for item in timings)
+    prompt_tokens = sum(item[1] for item in timings)
+    output_tokens = sum(item[2] for item in timings)
+    print(outputs[-1])
+    print(
+        f"Average generation latency: {elapsed / len(timings):.3f} s "
+        f"({len(timings)} run(s))"
+    )
+    print(
+        f"Throughput: {prompt_tokens / elapsed:.2f} prompt tok/s, "
+        f"{output_tokens / elapsed:.2f} output tok/s"
+    )
 
 if __name__ == "__main__":
     main()
